@@ -439,7 +439,10 @@ class AutonomousRunner:
                             if pending_sync_terms >= 45 or (pending_sync_terms > 0 and (ai_search_cycles + 1) % 3 == 0):
                                 log("[2B] Running skeleton deduplication & batch Cloudflare regex sync...")
                                 self.storage.run_search_skeleton_cleanup()
-                                sres = self.pentester.sync_search_policies(log_cb=log)
+                                sres = self.pentester.sync_search_policies(
+                                    log_cb=log,
+                                    phase_cb=lambda ph: emit_progress(2, ph.get("sync_detail", "Syncing Search Rules"), ph),
+                                )
                                 if sres.get("ok"):
                                     pending_sync_terms = 0
                                     sync_count += 1
@@ -476,7 +479,10 @@ class AutonomousRunner:
                 if not stop_ev.is_set():
                     log("\n[2C] Finalizing Skeleton Deduplication & Cloudflare Regex Sync...")
                     cleanup_res = self.storage.run_search_skeleton_cleanup()
-                    sync_res = self.pentester.sync_search_policies(log_cb=log)
+                    sync_res = self.pentester.sync_search_policies(
+                        log_cb=log,
+                        phase_cb=lambda ph: emit_progress(2, ph.get("sync_detail", "Final Search Regex Sync"), ph),
+                    )
                     if sync_res.get("ok"):
                         sync_count += 1
 

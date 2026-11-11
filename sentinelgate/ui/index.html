@@ -83,6 +83,7 @@
         <div class="topbar-badges">
           <span class="badge badge-lock" title="Allow rules and deletions are compiled out">Strict Block Mode</span>
           <span id="cf-status-badge" class="badge badge-warn">Cloudflare: Checking...</span>
+          <button id="btn-relaunch-admin" class="btn btn-sm btn-secondary" style="display:none" onclick="relaunchAsAdmin()">Unlock Admin (UAC)</button>
           <span id="rust-status-badge" class="badge badge-warn">Rust DFA: Checking...</span>
         </div>
       </header>
@@ -144,6 +145,20 @@
                 <div class="muted">Loading Cloudflare policy telemetry...</div>
               </div>
             </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Cloudflare Gateway Limits &amp; Quota Adaptation</h2>
+              <span class="tag tag-cyan">Auto-Sharding Active</span>
+            </div>
+            <div id="cf-quotas-grid" class="kpi-grid">
+              <div class="mini-row"><span>Gateway Lists</span><strong id="q-lists">-- / 100</strong></div>
+              <div class="mini-row"><span>DNS Policies</span><strong id="q-dns-pol">-- / 500</strong></div>
+              <div class="mini-row"><span>HTTP Policies</span><strong id="q-http-pol">-- / 500</strong></div>
+              <div class="mini-row"><span>Per-List / Expr Cap</span><strong id="q-item-cap">1000 / 4090</strong></div>
+            </div>
+            <div id="cf-quota-warnings" class="feedback"></div>
           </div>
 
           <div class="panel">
@@ -575,13 +590,14 @@
               <div class="mini-row" style="margin: 4px 0;">
                 <div>
                   <div><strong>Cloudflare Gateway Credentials</strong></div>
-                  <div class="muted">Sealed &amp; locked inside compiled binary/relay. Permanently hidden and non-editable.</div>
+                  <div class="muted">Locked to Windows Administrators &amp; SYSTEM only. Hidden, non-editable, and inaccessible without Administrator access.</div>
                 </div>
                 <span id="badge-cf-sealed" class="badge badge-lock">SEALED &amp; LOCKED</span>
               </div>
               <div class="btn-row">
                 <button class="btn btn-primary" onclick="saveVaultCredentials()">Save AI Keys to DPAPI Vault</button>
                 <button class="btn btn-secondary" onclick="testVaultConnections()">Test AI &amp; Cloudflare Health</button>
+                <button id="btn-settings-relaunch-admin" class="btn btn-secondary" style="display:none" onclick="relaunchAsAdmin()">Unlock Cloudflare (Admin UAC)</button>
                 <button class="btn btn-ghost" onclick="clearBackupGeminiKey()">Clear Backup Key</button>
               </div>
               <div id="vault-feedback" class="feedback"></div>
@@ -606,6 +622,7 @@
           <div class="console-title-group">
             <span id="job-status-pill" class="badge badge-idle">IDLE</span>
             <strong id="job-title">Ready for operations</strong>
+            <span id="sync-phase-pill" class="badge badge-lock hidden">SYNC PHASE</span>
             <span id="job-progress-text" class="muted"></span>
           </div>
           <div class="console-actions">

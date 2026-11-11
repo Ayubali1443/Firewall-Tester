@@ -211,6 +211,14 @@ def calculate_dynamic_chunks(
 
     try:
         for term in terms:
+            # Verify individual term fits inside Cloudflare's 4090-char and 512KB DFA budget
+            single_regex = build_flat_regex([term])
+            single_traffic = format_traffic_condition(single_regex)
+            if len(single_traffic) > 4090 or (has_rust and not _check_dfa(single_regex)):
+                if log_cb:
+                    log_cb(f"  [!] Skipping oversized term '{term}' (exceeds single-rule Cloudflare limit).")
+                continue
+
             current_chunk.append(term)
             test_regex = build_flat_regex(current_chunk)
             test_traffic = format_traffic_condition(test_regex)

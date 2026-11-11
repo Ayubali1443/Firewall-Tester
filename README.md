@@ -22,19 +22,21 @@ Secondary Strict Web Filter & On-Demand AI Threat Hunter targeting web proxies, 
 - `tests/` — Automated verification suite
 - `build.py` — Native executable compiler (`SentinelGateAI.exe` via Nuitka / PyInstaller)
 
-## Clean & Reinstall Scripts
+## Single-File Installer & Setup Scripts
 
-- **Clean all regenerable dependencies & build artifacts (production prep)**:
+- **Build ONE self-contained Windows Setup file (`dist/SentinelGateAI-Setup.exe`)** embedding the desktop app, UI, Python runtime, Rust `cf_validator.exe`, and sealed Rust `sg_seal.dll` (requires no Python/Rust on target PCs):
   ```powershell
-  .\clean.ps1
+  .\setup.ps1 -BuildSetup -SkipCredentials
   ```
-- **Reinstall `.venv`, compile Rust `cf_validator.exe`, and run tests**:
+  When run interactively, `SentinelGateAI-Setup.exe` prompts for Windows Administrator elevation (UAC), asks for **Cloudflare API** + **Gemini AI API** credentials, encrypts Cloudflare credentials via Windows Machine DPAPI + HKLM entropy, and locks `%ProgramData%\SentinelGateAI\AdminLock` and `HKLM\SOFTWARE\SentinelGateAI` exclusively to `SYSTEM` and `BUILTIN\Administrators` so standard/unelevated desktop users cannot access Cloudflare API.
+- **Reinstall dev environment & configure Admin-locked credentials (auto-installs Python/Rust if missing, creates `.venv`, compiles `cf_validator.exe`, runs tests, prompts via UAC for Cloudflare + Gemini APIs)**:
   ```powershell
   .\setup.ps1
   ```
-- **Full clean install + production `.exe` compile**:
+  *(Pass `-SkipCredentials` for unattended developer setup without credential prompts.)*
+- **Clean all regenerable dependencies & build artifacts (production Git prep)**:
   ```powershell
-  .\setup.ps1 -BuildExe
+  .\clean.ps1
   ```
 
 ## Running from Source

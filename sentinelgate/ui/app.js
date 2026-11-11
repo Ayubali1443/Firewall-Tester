@@ -105,12 +105,19 @@ async function refreshOverview() {
       : "DNS automated_block: Inactive/Missing";
 
     const cfBadge = document.getElementById("cf-status-badge");
+    const adminBtnTop = document.getElementById("btn-relaunch-admin");
     if (cf.ready) {
       cfBadge.textContent = `Cloudflare Engine: Ready (${cf.total_gateway_rules || 0} Rules)`;
       cfBadge.className = "badge badge-ok";
+      if (adminBtnTop) adminBtnTop.style.display = "none";
+    } else if (cf.admin_locked) {
+      cfBadge.textContent = "Cloudflare API: ADMIN LOCKED";
+      cfBadge.className = "badge badge-lock";
+      if (adminBtnTop) adminBtnTop.style.display = "inline-flex";
     } else {
       cfBadge.textContent = "Cloudflare Engine: Offline";
       cfBadge.className = "badge badge-warn";
+      if (adminBtnTop) adminBtnTop.style.display = "none";
     }
 
     const rustBadge = document.getElementById("rust-status-badge");
@@ -131,10 +138,19 @@ async function refreshOverview() {
 
     const rulesBox = document.getElementById("cf-rules-list");
     if (!cf.ready) {
-      rulesBox.innerHTML = `<div class="muted">Cloudflare Engine: Offline</div>`;
+      rulesBox.innerHTML = cf.admin_locked
+        ? `<div class="muted">Cloudflare API Locked: Windows Administrator access (UAC) is required to unlock Cloudflare credentials on this desktop.</div>`
+        : `<div class="muted">Cloudflare Engine: Offline</div>`;
     } else {
       const items = [];
-      items.push(`<div class="mini-row"><span><code>automated_block</code> (DNS)</span><span class="badge ${cf.dns_rule_active ? "badge-ok" : "badge-warn"}">${cf.dns_rule_active ? "ENABLED" : "NOT ACTIVE"}</span></div>`);
+      const dnsRules = cf.dns_rules || [];
+      if (dnsRules.length > 0) {
+        for (const dr of dnsRules) {
+          items.push(`<div class="mini-row"><span><code>${escapeHtml(dr.name)}</code> (DNS ${dr.traffic_length}/4090 chars)</span><span class="badge ${dr.enabled ? "badge-ok" : "badge-warn"}">${dr.enabled ? "ENABLED" : "DISABLED"}</span></div>`);
+        }
+      } else {
+        items.push(`<div class="mini-row"><span><code>automated_block</code> (DNS)</span><span class="badge ${cf.dns_rule_active ? "badge-ok" : "badge-warn"}">${cf.dns_rule_active ? "ENABLED" : "NOT ACTIVE"}</span></div>`);
+      }
       for (const sr of searchRules) {
         items.push(`<div class="mini-row"><span><code>${escapeHtml(sr.name)}</code> (${sr.traffic_length}/4090 chars)</span><span class="badge ${sr.enabled ? "badge-ok" : "badge-warn"}">${escapeHtml(sr.action).toUpperCase()}</span></div>`);
       }
@@ -143,6 +159,14 @@ async function refreshOverview() {
       }
       rulesBox.innerHTML = items.join("");
     }
+
+    const q = cf.quotas || {};
+    document.getElementById("q-lists").textContent = `${q.lists_used ?? "--"} / ${q.lists_limit ?? 100}`;
+    document.getElementById("q-dns-pol").textContent = `${q.dns_policies_used ?? "--"} / ${q.dns_policies_limit ?? 500}`;
+    document.getElementById("q-http-pol").textContent = `${q.http_policies_used ?? "--"} / ${q.http_policies_limit ?? 500}`;
+    document.getElementById("q-item-cap").textContent = `${q.per_list_item_limit ?? 1000} items • ${q.expression_char_limit ?? 4090} chars`;
+    const warns = q.warnings || [];
+    setFeedback("cf-quota-warnings", warns.length ? `Quota Alert: ${warns.join(" | ")}` : "All Cloudflare Gateway limits healthy.", warns.length === 0);
 
     const recentBox = document.getElementById("recent-jobs-list");
     const rj = data.recent_jobs || [];
@@ -587,12 +611,18 @@ async function refreshVaultAndSecurity() {
   cfSealedBadge.className = "badge badge-lock";
 
   const cf = overview.cloudflare || {};
+  const isAdmin = Boolean(overview.is_admin);
+  const adminBtnSettings = document.getElementById("btn-settings-relaunch-admin");
+  if (adminBtnSettings) {
+    adminBtnSettings.style.display = (!isAdmin && cf.admin_locked) ? "inline-flex" : "none";
+  }
   const integ = overview.integrity || {};
   const val = overview.validator || {};
   const diagBox = document.getElementById("security-diagnostics-box");
   diagBox.innerHTML = [
-    ["Cloudflare API Protection", "Hidden & locked inside sealed native engine (non-editable)", true, "SEALED & LOCKED"],
-    ["Cloudflare Engine Connectivity", cf.ready ? `Ready (${cf.total_gateway_rules || 0} Gateway Rules)` : "Offline", Boolean(cf.ready), cf.ready ? "READY" : "OFFLINE"],
+    ["Cloudflare API Protection", "Windows Admin/SYSTEM-only ACL + Machine DPAPI (non-editable)", true, "SEALED & LOCKED"],
+    ["Desktop Administrator Gate", isAdmin ? "Elevated Administrator session verified" : "Non-admin / unelevated session — Cloudflare API access blocked", isAdmin, isAdmin ? "ADMIN ACTIVE" : "ADMIN LOCKED"],
+    ["Cloudflare Engine Connectivity", cf.ready ? `Ready (${cf.total_gateway_rules || 0} Gateway Rules)` : (cf.admin_locked ? "Locked — Administrator UAC required" : "Offline"), Boolean(cf.ready), cf.ready ? "READY" : (cf.admin_locked ? "ADMIN LOCKED" : "OFFLINE")],
     ["AI Key DPAPI Vault", v.vault_encrypted ? "Active (Windows CryptProtectData - AI keys only)" : "Initializing", v.vault_encrypted, v.vault_encrypted ? "SECURE" : "WARN"],
     ["Immutable Baseline Blocklists", `DNS: ${integ.dns_active_count}/${integ.dns_baseline_count} • Search: ${integ.search_active_count}/${integ.search_baseline_count}`, integ.dns_intact && integ.search_intact, (integ.dns_intact && integ.search_intact) ? "SECURE" : "WARN"],
     ["Allow-Listing & Policy Deletion", "Disabled at API, UI & Storage layers", integ.block_only_enforced, integ.block_only_enforced ? "SECURE" : "WARN"],
@@ -628,6 +658,19 @@ async function clearBackupGeminiKey() {
   await apiFetch("/api/vault/clear-backup", { method: "POST" });
   setFeedback("vault-feedback", "Backup Gemini key cleared.", true);
   await refreshVaultAndSecurity();
+}
+
+async function relaunchAsAdmin() {
+  try {
+    const res = await apiFetch("/api/system/relaunch-admin", { method: "POST" });
+    if (res.already_admin) {
+      await refreshOverview();
+      return;
+    }
+    setFeedback("vault-feedback", "Launching Administrator session via Windows UAC...", true);
+  } catch (err) {
+    setFeedback("vault-feedback", err.message, false);
+  }
 }
 
 async function testVaultConnections() {
@@ -841,6 +884,7 @@ function watchJob(jobId, onComplete, onProgress) {
   document.getElementById("console-output").textContent = "";
   document.getElementById("job-status-pill").textContent = "RUNNING";
   document.getElementById("job-status-pill").className = "badge badge-running";
+  document.getElementById("sync-phase-pill").classList.add("hidden");
   document.getElementById("btn-stop-job").classList.remove("hidden");
   document.getElementById("job-progress-bar").style.width = "5%";
 
@@ -860,6 +904,24 @@ function watchJob(jobId, onComplete, onProgress) {
       }
 
       const prog = data.progress || {};
+      const syncPill = document.getElementById("sync-phase-pill");
+      if (prog.sync_phase) {
+        syncPill.classList.remove("hidden");
+        const phaseMap = {
+          dedup_packing: ["PACKING UNIQUE TERMS", "badge-running"],
+          fetching_rules: ["READING LIVE POLICIES", "badge-running"],
+          pushing_in_place: [`PUSHING IN-PLACE (${prog.pushed || 0}/${prog.total || "?"}) • 0 DELETIONS`, "badge-lock"],
+          trimming_trailing: [`TRIMMING TRAILING (${prog.deleted || 0}/${prog.delete_total || "?"})`, "badge-warn"],
+          aborted_preserved: ["INTERRUPTED • PRIOR RULES KEPT", "badge-err"],
+          completed: ["100% ENFORCED", "badge-ok"]
+        };
+        const [lbl, cls] = phaseMap[prog.sync_phase] || [String(prog.sync_phase).toUpperCase(), "badge-running"];
+        syncPill.textContent = lbl;
+        syncPill.className = `badge ${cls}`;
+        if (prog.sync_detail) {
+          document.getElementById("job-progress-text").textContent = prog.sync_detail;
+        }
+      }
       if (onProgress && Object.keys(prog).length > 0) {
         onProgress(prog);
       }

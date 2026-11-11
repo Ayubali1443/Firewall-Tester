@@ -15,21 +15,42 @@ Security Architecture:
 from __future__ import annotations
 
 import ctypes
+from ctypes import wintypes
 from dataclasses import dataclass
+import getpass
 import hashlib
+import json
 import os
 from pathlib import Path
 import secrets
+import sys
+from typing import Any
 
 from sentinelgate.config._seal_hash import EXPECTED_SEAL_DLL_SHA256
 from sentinelgate.config.paths import get_bundle_root, is_compiled_binary
+from sentinelgate.config.vault import (
+    ApiKeyVault,
+    dpapi_protect,
+    dpapi_unprotect,
+    save_gemini_install_seed,
+)
 
 _FIXED_SLOT_LEN = 256
+_CF_ADMIN_HKLM_SUBKEY = r"SOFTWARE\SentinelGateAI"
+_CF_ADMIN_ENTROPY_PREFIX = b"SentinelGateAI::CF_ADMIN::v1"
+_CF_ADMIN_DIR_SDDL = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+_CF_ADMIN_FILE_SDDL = "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+_CF_ADMIN_REG_SDDL = "D:P(A;OICI;KA;;;SY)(A;OICI;KA;;;BA)"
+_SE_FILE_OBJECT = 1
+_SE_REGISTRY_KEY = 4
+_OWNER_SECURITY_INFORMATION = 0x00000001
+_DACL_SECURITY_INFORMATION = 0x00000004
+_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
 
 
 @dataclass(frozen=True)
 class CloudflareTransportConfig:
-    mode: str  # "worker", "direct", or "none"
+    mode: str  # "worker", "direct", "admin_locked", or "none"
     account_id: str = ""
     api_token: str = ""
     worker_url: str = ""
@@ -41,6 +62,214 @@ class CloudflareTransportConfig:
         if self.mode == "direct":
             return bool(self.account_id and self.api_token)
         return False
+
+    def is_admin_locked(self) -> bool:
+        return self.mode == "admin_locked"
+
+
+def is_admin_process() -> bool:
+    """Return True when the current process holds Windows Administrator privileges."""
+    if os.name == "nt":
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def get_admin_cf_dir() -> Path:
+    """Return shared Admin-locked ProgramData directory for Cloudflare credentials."""
+    prog_data = os.environ.get("ProgramData") or r"C:\ProgramData"
+    return Path(prog_data) / "SentinelGateAI" / "AdminLock"
+
+
+def get_admin_cf_vault_path() -> Path:
+    """Return path to the Admin-ACL-protected Machine DPAPI Cloudflare credential blob."""
+    return get_admin_cf_dir() / "cf_admin.dpapi"
+
+
+def _apply_sddl_dacl(target: str | int, obj_type: int, sddl: str, by_handle: bool = False) -> None:
+    """Apply a protected Windows SDDL DACL (and BUILTIN\\Administrators owner when OS-elevated)."""
+    if os.name != "nt":
+        return
+
+    advapi32 = ctypes.windll.advapi32
+    kernel32 = ctypes.windll.kernel32
+    real_admin = False
+    try:
+        real_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        real_admin = False
+
+    full_sddl = f"O:BA{sddl}" if real_admin else sddl
+    p_sd = wintypes.LPVOID()
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(full_sddl, 1, ctypes.byref(p_sd), None):
+        raise OSError(f"ConvertStringSecurityDescriptorToSecurityDescriptorW failed: {ctypes.GetLastError()}")
+
+    try:
+        present = wintypes.BOOL()
+        defaulted = wintypes.BOOL()
+        p_dacl = wintypes.LPVOID()
+        if not advapi32.GetSecurityDescriptorDacl(p_sd, ctypes.byref(present), ctypes.byref(p_dacl), ctypes.byref(defaulted)):
+            raise OSError(f"GetSecurityDescriptorDacl failed: {ctypes.GetLastError()}")
+
+        p_owner = wintypes.LPVOID()
+        sec_info = _DACL_SECURITY_INFORMATION | _PROTECTED_DACL_SECURITY_INFORMATION
+        if real_admin and advapi32.GetSecurityDescriptorOwner(p_sd, ctypes.byref(p_owner), ctypes.byref(defaulted)) and p_owner.value:
+            sec_info |= _OWNER_SECURITY_INFORMATION
+        else:
+            p_owner = None
+
+        rc = (
+            advapi32.SetSecurityInfo(wintypes.HANDLE(target), obj_type, sec_info, p_owner, None, p_dacl, None)
+            if by_handle
+            else advapi32.SetNamedSecurityInfoW(str(target), obj_type, sec_info, p_owner, None, p_dacl, None)
+        )
+        if rc != 0:
+            raise PermissionError(f"Failed setting Windows Admin-only ACL (Win32 code {rc}).")
+    finally:
+        kernel32.LocalFree(p_sd)
+
+
+def lock_path_admin_only(path: Path, is_dir: bool = False) -> None:
+    """Restrict filesystem object permissions exclusively to NT AUTHORITY\\SYSTEM and BUILTIN\\Administrators."""
+    _apply_sddl_dacl(
+        str(path),
+        _SE_FILE_OBJECT,
+        _CF_ADMIN_DIR_SDDL if is_dir else _CF_ADMIN_FILE_SDDL,
+        by_handle=False,
+    )
+
+
+def save_admin_cf_credentials(
+    account_id: str = "",
+    api_token: str = "",
+    worker_url: str = "",
+    worker_token: str = "",
+    vault_path: Path | None = None,
+    entropy_bytes: bytes | None = None,
+) -> None:
+    """Encrypt and store Cloudflare credentials in a strict Windows Administrator/SYSTEM-only vault."""
+    if os.name == "nt" and not is_admin_process():
+        raise PermissionError("Administrator access on this desktop is required to configure Cloudflare credentials.")
+
+    w_url = (worker_url or "").strip().rstrip("/")
+    w_tok = (worker_token or "").strip()
+    acct = (account_id or "").strip()
+    tok = (api_token or "").strip()
+    if w_url and w_tok:
+        mode = "worker"
+    elif acct and tok:
+        mode = "direct"
+    else:
+        raise ValueError("Provide either Cloudflare Account ID + API Token or Worker URL + Relay Secret.")
+
+    reg_entropy = entropy_bytes
+    if reg_entropy is None:
+        reg_entropy = os.urandom(32)
+        if os.name == "nt":
+            import winreg
+
+            with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, _CF_ADMIN_HKLM_SUBKEY, 0, winreg.KEY_ALL_ACCESS) as key:
+                winreg.SetValueEx(key, "SealEntropy", 0, winreg.REG_BINARY, reg_entropy)
+                winreg.SetValueEx(key, "Mode", 0, winreg.REG_SZ, mode)
+                _apply_sddl_dacl(int(key.handle), _SE_REGISTRY_KEY, _CF_ADMIN_REG_SDDL, by_handle=True)
+
+    payload = json.dumps(
+        {
+            "mode": mode,
+            "account_id": acct if mode == "direct" else "",
+            "api_token": tok if mode == "direct" else "",
+            "worker_url": w_url if mode == "worker" else "",
+            "worker_token": w_tok if mode == "worker" else "",
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    dpapi_entropy = _CF_ADMIN_ENTROPY_PREFIX + (reg_entropy or b"")
+    cipher = dpapi_protect(payload, entropy=dpapi_entropy, local_machine=True)
+
+    target = vault_path or get_admin_cf_vault_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock_path_admin_only(target.parent, is_dir=True)
+    target.write_bytes(cipher)
+    lock_path_admin_only(target, is_dir=False)
+
+
+def _read_hklm_entropy() -> bytes:
+    if os.name != "nt":
+        return b""
+    import winreg
+
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _CF_ADMIN_HKLM_SUBKEY, 0, winreg.KEY_READ) as key:
+        val, _ = winreg.QueryValueEx(key, "SealEntropy")
+        return bytes(val) if val else b""
+
+
+def is_admin_cf_store_present(vault_path: Path | None = None) -> bool:
+    """Detect whether an Admin-locked Cloudflare credential store exists (even if read is denied)."""
+    if os.name == "nt":
+        import winreg
+
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _CF_ADMIN_HKLM_SUBKEY, 0, winreg.KEY_READ):
+                return True
+        except PermissionError:
+            return True
+        except FileNotFoundError:
+            pass
+
+    target = vault_path or get_admin_cf_vault_path()
+    for p in (target.parent, target):
+        try:
+            os.stat(p)
+            return True
+        except PermissionError:
+            return True
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return True
+    return False
+
+
+def load_admin_cf_credentials(
+    vault_path: Path | None = None,
+    entropy_bytes: bytes | None = None,
+) -> CloudflareTransportConfig:
+    """Load Cloudflare transport config ONLY if Administrator privileges succeed against ACL & DPAPI."""
+    if os.name == "nt" and not is_admin_process():
+        if is_admin_cf_store_present(vault_path):
+            return CloudflareTransportConfig(mode="admin_locked")
+        return CloudflareTransportConfig(mode="none")
+
+    target = vault_path or get_admin_cf_vault_path()
+    try:
+        reg_entropy = entropy_bytes if entropy_bytes is not None else _read_hklm_entropy()
+        cipher = target.read_bytes()
+        dpapi_entropy = _CF_ADMIN_ENTROPY_PREFIX + (reg_entropy or b"")
+        plain = dpapi_unprotect(cipher, entropy=dpapi_entropy, local_machine=True)
+        data = json.loads(plain.decode("utf-8"))
+        if not isinstance(data, dict):
+            return CloudflareTransportConfig(mode="none")
+        mode = str(data.get("mode") or "")
+        if mode == "worker":
+            w_url = str(data.get("worker_url") or "").strip().rstrip("/")
+            w_tok = str(data.get("worker_token") or "").strip()
+            if w_url and w_tok:
+                return CloudflareTransportConfig(mode="worker", worker_url=w_url, worker_token=w_tok)
+        elif mode == "direct":
+            acct = str(data.get("account_id") or "").strip()
+            tok = str(data.get("api_token") or "").strip()
+            if acct and tok:
+                return CloudflareTransportConfig(mode="direct", account_id=acct, api_token=tok)
+    except PermissionError:
+        return CloudflareTransportConfig(mode="admin_locked")
+    except FileNotFoundError:
+        return CloudflareTransportConfig(mode="none")
+    except Exception:
+        return CloudflareTransportConfig(mode="none")
+    return CloudflareTransportConfig(mode="none")
 
 
 def _derive_stream(key: bytes, salt: bytes, slot_id: int, length: int) -> bytes:
@@ -90,22 +319,27 @@ def build_native_seal_rust_source(
     api_token: str = "",
     worker_url: str = "",
     worker_token: str = "",
+    admin_vault: bool = False,
 ) -> str:
     """Generate stripped native Rust cdylib source encoding sealed transport credentials.
 
     Includes Windows anti-debugger detection and volatile memory wiping.
+    Supports:
+    - mode 1: Direct sealed Cloudflare credentials
+    - mode 2: Zero-Token Worker Relay
+    - mode 3: Windows Admin-Locked Vault (credentials prompted during desktop Setup)
     """
     use_worker = bool(worker_url.strip() and worker_token.strip())
     use_direct = bool(account_id.strip() and api_token.strip())
-    if not use_worker and not use_direct:
-        raise ValueError("Provide either Worker credentials or Direct Cloudflare credentials.")
+    if not use_worker and not use_direct and not admin_vault:
+        raise ValueError("Provide Worker credentials, Direct Cloudflare credentials, or admin_vault=True.")
 
-    mode_num = 2 if use_worker else 1
+    mode_num = 2 if use_worker else (1 if use_direct else 3)
     slots = [
-        _encode_slot_bytes(account_id if not use_worker else "", 0),
-        _encode_slot_bytes(api_token if not use_worker else "", 1),
-        _encode_slot_bytes(worker_url.rstrip("/") if use_worker else "", 2),
-        _encode_slot_bytes(worker_token if use_worker else "", 3),
+        _encode_slot_bytes(account_id if mode_num == 1 else "", 0),
+        _encode_slot_bytes(api_token if mode_num == 1 else "", 1),
+        _encode_slot_bytes(worker_url.rstrip("/") if mode_num == 2 else "", 2),
+        _encode_slot_bytes(worker_token if mode_num == 2 else "", 3),
     ]
 
     def fmt_u8(arr: list[int]) -> str:
@@ -220,7 +454,7 @@ static SLOTS: [SlotData; 4] = [
     SlotData {{ k: {fmt_u8(slots[1]["k"])}, s: {fmt_u8(slots[1]["s"])}, p: {fmt_usize(slots[1]["p"])}, c: {fmt_u8(slots[1]["c"])} }},
     SlotData {{ k: {fmt_u8(slots[2]["k"])}, s: {fmt_u8(slots[2]["s"])}, p: {fmt_usize(slots[2]["p"])}, c: {fmt_u8(slots[2]["c"])} }},
     SlotData {{ k: {fmt_u8(slots[3]["k"])}, s: {fmt_u8(slots[3]["s"])}, p: {fmt_usize(slots[3]["p"])}, c: {fmt_u8(slots[3]["c"])} }},
-}};
+];
 
 #[inline(never)]
 fn volatile_zero(buf: &mut [u8]) {{
@@ -334,21 +568,39 @@ def _read_native_slot(lib: ctypes.CDLL, slot_id: int) -> str:
 
 
 def get_cloudflare_transport_config() -> CloudflareTransportConfig:
-    """Resolve Cloudflare transport from stripped native sg_seal.dll (or env in unbuilt dev/tests)."""
+    """Resolve Cloudflare transport enforcing desktop Administrator privilege boundaries.
+
+    On Windows:
+    - Any unelevated / standard-user process receives `mode='admin_locked'` whenever
+      the Admin-only Cloudflare vault exists or when running as a compiled desktop build.
+    - Only Windows Administrator processes can unseal `%ProgramData%\\SentinelGateAI\\AdminLock`
+      + `HKLM\\SOFTWARE\\SentinelGateAI`.
+    """
     lib = _load_native_seal_dll()
-    if lib is not None:
-        mode_num = lib.sg_seal_mode()
-        if mode_num == 2:
-            w_url = _read_native_slot(lib, 2)
-            w_tok = _read_native_slot(lib, 3)
-            if w_url and w_tok:
-                return CloudflareTransportConfig(mode="worker", worker_url=w_url, worker_token=w_tok)
-        elif mode_num == 1:
-            acct = _read_native_slot(lib, 0)
-            tok = _read_native_slot(lib, 1)
-            if acct and tok:
-                return CloudflareTransportConfig(mode="direct", account_id=acct, api_token=tok)
-        return CloudflareTransportConfig(mode="none")
+
+    if os.name == "nt" and not is_admin_process():
+        if is_admin_cf_store_present() or is_compiled_binary() or lib is not None:
+            return CloudflareTransportConfig(mode="admin_locked")
+    else:
+        admin_cfg = load_admin_cf_credentials()
+        if admin_cfg.is_ready():
+            return admin_cfg
+
+        if lib is not None:
+            mode_num = lib.sg_seal_mode()
+            if mode_num == 2:
+                w_url = _read_native_slot(lib, 2)
+                w_tok = _read_native_slot(lib, 3)
+                if w_url and w_tok:
+                    return CloudflareTransportConfig(mode="worker", worker_url=w_url, worker_token=w_tok)
+            elif mode_num == 1:
+                acct = _read_native_slot(lib, 0)
+                tok = _read_native_slot(lib, 1)
+                if acct and tok:
+                    return CloudflareTransportConfig(mode="direct", account_id=acct, api_token=tok)
+            elif mode_num == 3:
+                return CloudflareTransportConfig(mode="none")
+            return CloudflareTransportConfig(mode="none")
 
     # Never read env vars when running from a compiled desktop executable
     if is_compiled_binary():
@@ -371,3 +623,48 @@ def get_cloudflare_credentials() -> tuple[str, str]:
     """Legacy tuple helper returning (account_id, api_token) when in direct mode."""
     cfg = get_cloudflare_transport_config()
     return cfg.account_id, cfg.api_token
+
+
+def interactive_admin_setup() -> int:
+    """Elevated Administrator setup prompt for Cloudflare API & Gemini API credentials."""
+    print("=== SentinelGate AI - Administrator Credential Setup ===")
+    if os.name == "nt" and not is_admin_process():
+        print("[ERROR] Windows Administrator privileges are required to lock Cloudflare credentials.")
+        return 5
+
+    already_locked = is_admin_cf_store_present()
+    if already_locked:
+        print("An Admin-locked Cloudflare store already exists on this PC (leave blank to keep).")
+
+    acct_id = input("Enter Cloudflare Account ID (or leave blank to keep/skip): ").strip()
+    cf_token = getpass.getpass("Enter Cloudflare API Token (hidden, leave blank to keep/skip): ").strip()
+    if acct_id and cf_token:
+        save_admin_cf_credentials(account_id=acct_id, api_token=cf_token)
+        print("[OK] Cloudflare credentials sealed in Admin/SYSTEM-only store (Machine DPAPI + HKLM + NTFS ACL).")
+    elif not already_locked:
+        print("[!] Cloudflare credentials skipped — re-run elevated setup anytime to configure.")
+
+    vault = ApiKeyVault()
+    has_gem = vault.get_masked_status()["keys"]["GEMINI_API_KEY"]["configured"]
+    prompt_suffix = " (leave blank to keep existing)" if has_gem else ""
+    gem_key = getpass.getpass(f"Enter Gemini AI API Key (hidden){prompt_suffix}: ").strip()
+    gem_backup = getpass.getpass("Enter optional Backup Gemini AI API Key (hidden, Enter to skip): ").strip()
+    if gem_key or gem_backup:
+        updates: dict[str, str] = {}
+        if gem_key:
+            updates["GEMINI_API_KEY"] = gem_key
+        if gem_backup:
+            updates["GEMINI_API_KEY_BACKUP"] = gem_backup
+        vault.update_credentials(updates)
+        if gem_key:
+            save_gemini_install_seed(gem_key, gem_backup)
+        print("[OK] Gemini AI API key encrypted in Windows DPAPI Vault.")
+    else:
+        print("[OK] Gemini AI API key configuration unchanged.")
+
+    return 0
+
+
+if __name__ == "__main__":
+    if "--interactive-setup" in sys.argv[1:]:
+        raise SystemExit(interactive_admin_setup())

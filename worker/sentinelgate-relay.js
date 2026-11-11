@@ -72,7 +72,7 @@ export default {
     }
 
     if (method === "GET" && path === "/v1/lists") {
-      return cfFetch(env, "/lists", { method: "GET" });
+      return cfFetch(env, `/lists${url.search || ""}`, { method: "GET" });
     }
 
     const listMatch = path.match(/^\/v1\/lists\/([a-f0-9-]{36})$/);
@@ -101,7 +101,7 @@ export default {
     }
 
     if (method === "GET" && path === "/v1/rules") {
-      return cfFetch(env, "/rules", { method: "GET" });
+      return cfFetch(env, `/rules${url.search || ""}`, { method: "GET" });
     }
 
     if (method === "POST" && path === "/v1/rules") {
@@ -122,12 +122,27 @@ export default {
     }
 
     if (method === "DELETE" && ruleMatch) {
-      // Allow removing ONLY trailing split search chunks during regex consolidation
-      const lookup = await cfFetch(env, `/rules/${ruleMatch[1]}`, { method: "GET" });
-      const lookupJson = await lookup.json();
-      const ruleName = lookupJson?.result?.name || "";
-      if (!/^automated_http_search_block_p([2-9]|[1-9]\d+)$/.test(ruleName)) {
+      // Allow removing ONLY trailing split chunks during regex/DNS consolidation
+      // AND only when an active primary block rule remains enabled
+      const allRulesRes = await cfFetch(env, "/rules?per_page=100", { method: "GET" });
+      const allRules = (await allRulesRes.json())?.result || [];
+      const targetRule = allRules.find((r) => r.id === ruleMatch[1]);
+      const ruleName = targetRule?.name || "";
+      const isTrailingSearch = /^automated_http_search_block_p([2-9]|[1-9]\d+)$/.test(ruleName);
+      const isTrailingDns = /^automated_block_p([2-9]|[1-9]\d+)$/.test(ruleName);
+      if (!isTrailingSearch && !isTrailingDns) {
         return jsonResp({ success: false, error: "Policy deletion is prohibited." }, 403);
+      }
+      const primaryPrefix = isTrailingSearch ? "automated_http_search_block" : "automated_block";
+      const hasPrimaryBlock = allRules.some(
+        (r) =>
+          r.id !== ruleMatch[1] &&
+          r.enabled === true &&
+          r.action === "block" &&
+          (r.name === primaryPrefix || r.name === `${primaryPrefix}_p1`)
+      );
+      if (!hasPrimaryBlock) {
+        return jsonResp({ success: false, error: "Cannot delete trailing chunk without an active primary block rule." }, 403);
       }
       return cfFetch(env, `/rules/${ruleMatch[1]}`, { method: "DELETE" });
     }

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import ctypes
+import os
 import random
 import secrets
+import sys
 import threading
 import time
 import traceback
@@ -14,8 +17,8 @@ import uuid
 from flask import Flask, jsonify, request, send_from_directory
 
 from sentinelgate import __app_name__, __version__
-from sentinelgate.config.cf_secrets import get_cloudflare_transport_config
-from sentinelgate.config.paths import get_ui_dir
+from sentinelgate.config.cf_secrets import get_cloudflare_transport_config, is_admin_process
+from sentinelgate.config.paths import get_ui_dir, is_compiled_binary
 from sentinelgate.config.vault import ApiKeyVault
 from sentinelgate.core.cleaner import generate_human_variations
 from sentinelgate.core.cloudflare import CloudflareReadOnlyClient
@@ -193,6 +196,7 @@ def create_app(session_token: str | None = None) -> tuple[Flask, str]:
                 "ok": True,
                 "app_name": __app_name__,
                 "version": __version__,
+                "is_admin": is_admin_process(),
                 "integrity": integrity,
                 "validator": {"ok": val_ok, "detail": val_info},
                 "cloudflare": cf_overview,
@@ -356,8 +360,8 @@ def create_app(session_token: str | None = None) -> tuple[Flask, str]:
     def api_search_sync() -> Any:
         job = jobs.start_job(
             "search_sync",
-            "Compile Regex Chunks & Sync to Cloudflare HTTP Rules",
-            lambda j: pentester.sync_search_policies(log_cb=j.append_log),
+            "Atomic Search Regex Sync (In-Place Push -> Safe Trim)",
+            lambda j: pentester.sync_search_policies(log_cb=j.append_log, phase_cb=j.set_progress),
         )
         return jsonify({"ok": True, "job_id": job.job_id})
 
@@ -646,5 +650,24 @@ def create_app(session_token: str | None = None) -> tuple[Flask, str]:
                 "gemini_backup": backup_res,
             }
         )
+
+    @app.post("/api/system/relaunch-admin")
+    def api_relaunch_admin() -> Any:
+        if is_admin_process():
+            return jsonify({"ok": True, "already_admin": True})
+        if os.name != "nt":
+            return jsonify({"ok": False, "error": "Administrator UAC elevation is only supported on Windows."}), 400
+        exe = sys.executable
+        params = "" if is_compiled_binary() else "-m sentinelgate.main"
+        rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+        if int(rc) <= 32:
+            return jsonify(
+                {
+                    "ok": False,
+                    "error": "Windows Administrator UAC elevation declined or unavailable.",
+                }
+            ), 403
+        threading.Timer(0.4, os._exit, args=(0,)).start()
+        return jsonify({"ok": True, "relaunching": True})
 
     return app, token

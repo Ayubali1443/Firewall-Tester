@@ -231,3 +231,39 @@ def run_virtual_pentest_for_terms(terms: list[str], variants_per_term: int = 800
         "block_rate": block_rate,
         "bypasses": bypasses[:100],
     }
+
+
+def deduplicate_terms_for_sync(terms: list[str]) -> tuple[list[str], int]:
+    """Eliminate case/whitespace/skeleton duplicates before Cloudflare chunking.
+
+    Prefers compact no-space canonical forms (e.g., 'croxyproxy' over 'croxy proxy')
+    because obfuscate_term inserts optional separators between letters, covering both.
+    """
+    seen_lower: set[str] = set()
+    unique_raw: list[str] = []
+    for raw in terms:
+        clean = re.sub(r"\s+", " ", str(raw or "").strip().lower())
+        if clean and clean not in seen_lower:
+            seen_lower.add(clean)
+            unique_raw.append(clean)
+
+    # Sort so clean pure-alphabetic compact forms win over digits/leetspeak/spaced duplicates
+    ordered = sorted(
+        unique_raw,
+        key=lambda w: (bool(re.search(r"[^a-zA-Z\s]", w)), " " in w, len(w)),
+    )
+
+    by_skeleton: dict[str, str] = {}
+    deduped: list[str] = []
+    for w in ordered:
+        skel = get_skeleton(w)
+        if skel and len(skel) >= 3:
+            if skel in by_skeleton:
+                continue
+            by_skeleton[skel] = w
+        deduped.append(w)
+
+    # Restore deterministic alphabetical ordering for stable chunk diffs
+    deduped.sort()
+    removed_count = len(terms) - len(deduped)
+    return deduped, max(0, removed_count)

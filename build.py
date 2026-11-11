@@ -23,6 +23,7 @@ HASH_FILE = ROOT / "sentinelgate" / "core" / "_validator_hash.py"
 SEAL_BUILD_DIR = ROOT / "sentinelgate" / "config" / "_seal_build"
 SEAL_DLL_PATH = ROOT / "sentinelgate" / "config" / "sg_seal.dll"
 SEAL_HASH_FILE = ROOT / "sentinelgate" / "config" / "_seal_hash.py"
+INSTALLER_SRC = ROOT / "sentinelgate" / "installer" / "src" / "main.rs"
 
 
 def build_rust_validator() -> None:
@@ -47,6 +48,7 @@ def compile_native_seal_dll(
     api_token: str = "",
     worker_url: str = "",
     worker_token: str = "",
+    admin_vault: bool = False,
     out_dll: Path | None = None,
     write_hash_module: bool = True,
 ) -> str:
@@ -59,6 +61,7 @@ def compile_native_seal_dll(
         api_token=api_token,
         worker_url=worker_url,
         worker_token=worker_token,
+        admin_vault=admin_vault,
     )
     rs_file.write_text(rs_source, encoding="utf-8")
 
@@ -101,8 +104,8 @@ def compile_native_seal_dll(
     return digest
 
 
-def prepare_native_seal() -> None:
-    """Seal Worker or Direct Cloudflare credentials into stripped native sg_seal.dll."""
+def prepare_native_seal(prompt_seal: bool = False) -> None:
+    """Seal Worker, Direct, or Desktop Admin-Vault Cloudflare mode into stripped native sg_seal.dll."""
     print("[2/4] Sealing Cloudflare transport into stripped native Rust DLL (anti-debug + volatile wipe)...")
     worker_url = (os.environ.get("SG_WORKER_URL") or "").strip().rstrip("/")
     worker_token = (os.environ.get("SG_WORKER_TOKEN") or "").strip()
@@ -116,22 +119,37 @@ def prepare_native_seal() -> None:
     if not api_token:
         api_token = v_tok
 
+    use_admin_vault = False
     if not (worker_url and worker_token) and not (acct_id and api_token):
-        mode = input("Select sealing mode - [1] Zero-Token Worker Relay (Recommended) or [2] Direct Cloudflare API: ").strip()
-        if mode == "1":
-            worker_url = input("Enter Cloudflare Worker Relay URL (e.g. https://sentinelgate-relay.<sub>.workers.dev): ").strip().rstrip("/")
-            worker_token = getpass.getpass("Enter RELAY_CLIENT_SECRET (hidden): ").strip()
+        if prompt_seal:
+            mode = input(
+                "Select sealing mode - [1] Desktop Setup Prompt + Admin ACL Vault (Recommended), "
+                "[2] Embedded Zero-Token Worker, or [3] Embedded Direct CF: "
+            ).strip()
+            if mode == "2":
+                worker_url = input("Enter Cloudflare Worker Relay URL: ").strip().rstrip("/")
+                worker_token = getpass.getpass("Enter RELAY_CLIENT_SECRET (hidden): ").strip()
+            elif mode == "3":
+                acct_id = input("Enter Cloudflare Account ID (will be sealed into native DLL): ").strip()
+                api_token = getpass.getpass("Enter Cloudflare API Token (hidden, sealed into native DLL): ").strip()
+            else:
+                use_admin_vault = True
         else:
-            acct_id = input("Enter Cloudflare Account ID (will be sealed into native DLL): ").strip()
-            api_token = getpass.getpass("Enter Cloudflare API Token (hidden, sealed into native DLL): ").strip()
+            use_admin_vault = True
 
     digest = compile_native_seal_dll(
         account_id=acct_id,
         api_token=api_token,
         worker_url=worker_url,
         worker_token=worker_token,
+        admin_vault=use_admin_vault,
     )
-    mode_desc = "Zero-Token Worker Relay" if (worker_url and worker_token) else "Direct Native Sealed"
+    if use_admin_vault:
+        mode_desc = "Desktop Admin-Vault Mode (Setup prompts CF + Gemini & locks to Admin/SYSTEM)"
+    elif worker_url and worker_token:
+        mode_desc = "Zero-Token Worker Relay"
+    else:
+        mode_desc = "Direct Native Sealed"
     print(f"  [OK] {mode_desc} sg_seal.dll compiled & stripped (SHA-256: {digest[:16]}...)")
 
 
@@ -212,18 +230,52 @@ def build_pyinstaller() -> None:
         str(ROOT / "sentinelgate" / "main.py"),
     ]
     subprocess.run(cmd, cwd=str(ROOT), check=True)
+    exe_path = DIST_DIR / "SentinelGateAI.exe"
     print("[4/4] PyInstaller build finished successfully.")
 
 
+def build_single_setup_installer(payload_exe: Path, out_setup: Path | None = None) -> Path:
+    """Compile single self-contained SentinelGateAI-Setup.exe via Rust embedding payload_exe."""
+    if not payload_exe.exists():
+        raise FileNotFoundError(f"Payload executable missing at {payload_exe}")
+    target_setup = out_setup or (DIST_DIR / "SentinelGateAI-Setup.exe")
+    target_setup.parent.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env["SG_PAYLOAD_EXE"] = str(payload_exe.resolve())
+    cmd = [
+        "rustc",
+        "--edition",
+        "2021",
+        "-C",
+        "opt-level=3",
+        "-C",
+        "lto=fat",
+        "-C",
+        "strip=symbols",
+        "-o",
+        str(target_setup),
+        str(INSTALLER_SRC),
+    ]
+    subprocess.run(cmd, env=env, cwd=str(ROOT), check=True)
+    for sidecar_ext in (".pdb", ".exp", ".lib"):
+        sc = target_setup.with_suffix(sidecar_ext)
+        if sc.exists():
+            sc.unlink()
+    return target_setup
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build tamper-proof SentinelGateAI.exe")
+    parser = argparse.ArgumentParser(description="Build tamper-proof SentinelGateAI.exe and single-file Setup")
     parser.add_argument("--backend", choices=["nuitka", "pyinstaller"], default="nuitka")
     parser.add_argument("--standalone-dir", action="store_true", help="Build Nuitka folder instead of onefile exe")
+    parser.add_argument("--skip-setup", action="store_true", help="Skip packaging SentinelGateAI-Setup.exe")
+    parser.add_argument("--only-setup-file", action="store_true", help="Keep only SentinelGateAI-Setup.exe in dist/")
+    parser.add_argument("--prompt-seal", action="store_true", help="Interactively choose embedded vs setup-time CF sealing")
     args = parser.parse_args()
 
     try:
         build_rust_validator()
-        prepare_native_seal()
+        prepare_native_seal(prompt_seal=args.prompt_seal)
         if args.backend == "nuitka":
             build_nuitka(onefile=not args.standalone_dir)
         else:
@@ -232,7 +284,14 @@ def main() -> None:
         cleanup_build_artifacts()
 
     exe_path = DIST_DIR / "SentinelGateAI.exe"
-    print(f"\n[DONE] Output executable: {exe_path} (exists={exe_path.exists()})")
+    if not args.skip_setup and not args.standalone_dir and exe_path.exists():
+        print("[5/5] Packaging single self-contained SentinelGateAI-Setup.exe...")
+        setup_path = build_single_setup_installer(exe_path)
+        if args.only_setup_file and exe_path.exists():
+            exe_path.unlink()
+        print(f"\n[DONE] Single Setup Installer: {setup_path} ({setup_path.stat().st_size / (1024*1024):.2f} MB)")
+    else:
+        print(f"\n[DONE] Output executable: {exe_path} (exists={exe_path.exists()})")
 
 
 if __name__ == "__main__":
