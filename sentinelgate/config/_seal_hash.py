@@ -1,5 +1,5 @@
 """Auto-maintained integrity digest and obfuscated build handshake parts (empty in unbuilt source)."""
 
-EXPECTED_SEAL_DLL_SHA256 = ""
-SEAL_PART_A = b""
-SEAL_PART_B = b""
+EXPECTED_SEAL_DLL_SHA256 = "3C476278E3A04CB5B76207FC491985F112EDFBA66F1BF0217BFC0B3E2FD0F239"
+SEAL_PART_A = b'\x03:\xe7\xcd\xf1X\xf0\x8c?\x01\xdb\x8b\x84\x14A1n\x9b\xf2\x1a\xa3\n\xa1\x00\x7f\xe9C\x8d\xad0\xa0\xa2'
+SEAL_PART_B = b"T\xa3\xfa\x14UG\xc8\xa2J\x8b\xdc\xac\x01\x08\xe2\x13\xef\xa5N\x15\xb7\rt\x8b'7\xae\x1d\x1d%n "
