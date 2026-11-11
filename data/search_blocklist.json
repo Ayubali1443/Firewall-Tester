@@ -1,0 +1,142 @@
+{
+    "Web Proxies+block": {
+        "category": "Proxies",
+        "action": "block",
+        "ai_target": true,
+        "scope": "slip_through",
+        "description": "Web-based proxy search vectors, unblocker portals, and proxy mirror keywords.",
+        "terms": [
+            "web proxy",
+            "croxyproxy",
+            "proxysite",
+            "proxyium",
+            "blockaway",
+            "4everproxy"
+        ],
+        "history": []
+    },
+    "CGIProxies+block": {
+        "category": "CGIProxies",
+        "action": "block",
+        "ai_target": true,
+        "scope": "slip_through",
+        "description": "CGI proxy scripts, Glype/PHProxy/MiniProxy search queries, Ultraviolet/Rammerhead web unblocker queries.",
+        "terms": [
+            "cgi proxy",
+            "glype proxy",
+            "phproxy",
+            "miniproxy",
+            "rammerhead",
+            "ultraviolet proxy",
+            "holy unblocker",
+            "interstellar proxy",
+            "node unblocker",
+            "incognito proxy"
+        ],
+        "history": []
+    },
+    "Downloaders+block": {
+        "category": "Downloaders",
+        "action": "block",
+        "ai_target": true,
+        "scope": "slip_through",
+        "description": "Media downloaders, stream rippers, and converter search keywords.",
+        "terms": [
+            "y2mate",
+            "savefrom",
+            "9xbuddy",
+            "snaptik",
+            "snapinsta",
+            "yt1s",
+            "ytmp3",
+            "ytmp4",
+            "cobalt tools",
+            "loader to",
+            "invidious",
+            "piped"
+        ],
+        "history": []
+    },
+    "SoftwareDownloadSites+block": {
+        "category": "SoftwareDownloadSites",
+        "action": "block",
+        "ai_target": true,
+        "scope": "slip_through",
+        "description": "Software download portals, portable EXE/APK repositories, and crack/repack hubs.",
+        "terms": [
+            "filehippo",
+            "softonic",
+            "softpedia",
+            "uptodown",
+            "apkpure",
+            "apkmirror",
+            "getintopc",
+            "filecr",
+            "portableapps",
+            "fitgirl repack"
+        ],
+        "history": []
+    },
+    "SearchEngines+block": {
+        "category": "SearchEngines",
+        "action": "block",
+        "ai_target": true,
+        "scope": "slip_through",
+        "description": "Alternative search engines and private metasearch frontends bypassing Google SafeSearch.",
+        "terms": [
+            "duckduckgo",
+            "yandex",
+            "searxng",
+            "searx",
+            "startpage",
+            "qwant",
+            "ecosia",
+            "mojeek",
+            "brave search",
+            "whoogle"
+        ],
+        "history": []
+    },
+    "ObscureAdult+block": {
+        "category": "ObscureAdult",
+        "action": "block",
+        "ai_target": true,
+        "scope": "slip_through",
+        "description": "Obscure adult slang, leak aggregators, and mirror hubs slipping past SafeSearch.",
+        "terms": [
+            "bunkr",
+            "coomer",
+            "kemono",
+            "simpcity",
+            "fapello",
+            "erome",
+            "thothub",
+            "missav",
+            "kamakath",
+            "velamma"
+        ],
+        "history": []
+    },
+    "AdultImageHosts+block": {
+        "category": "AdultImageHosts",
+        "action": "block",
+        "ai_target": true,
+        "scope": "slip_through",
+        "description": "Dedicated sole-porn/nude/topless image hosting websites and adult imageboards ONLY (strictly excludes multipurpose CDNs).",
+        "terms": [
+            "imagetwist",
+            "imagevenue",
+            "pixhost",
+            "imx to",
+            "imgspice",
+            "acidimg",
+            "turboimagehost",
+            "vipr im",
+            "pimpandhost",
+            "imagebam",
+            "rule34",
+            "gelbooru"
+        ],
+        "history": []
+    }
+}

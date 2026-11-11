@@ -1,0 +1,107 @@
+{
+    "SearchEngines+allow": {
+        "category": "SearchEngines",
+        "action": "allow",
+        "domains": [
+            "google.com"
+        ]
+    },
+    "Tech+allow": {
+        "category": "Tech",
+        "action": "allow",
+        "domains": [
+            "github.com",
+            "stackoverflow.com",
+            "gitlab.com",
+            "bitbucket.org",
+            "aws.amazon.com",
+            "azure.microsoft.com",
+            "cloud.google.com",
+            "cloudflare.com",
+            "digitalocean.com",
+            "docker.com",
+            "kubernetes.io",
+            "npm.im",
+            "pypi.org",
+            "atlassian.com"
+        ]
+    },
+    "Education+allow": {
+        "category": "Education",
+        "action": "allow",
+        "domains": [
+            "coursera.org",
+            "edx.org",
+            "khanacademy.org",
+            "w3schools.com",
+            "freecodecamp.org",
+            "tutorialspoint.com",
+            "geeksforgeeks.org",
+            "nptel.ac.in",
+            "ignou.ac.in",
+            "swayam.gov.in",
+            "udacity.com",
+            "codecademy.com",
+            "leetcode.com",
+            "hackerrank.com"
+        ]
+    },
+    "Finance+allow": {
+        "category": "Finance",
+        "action": "allow",
+        "domains": [
+            "hdfcbank.com",
+            "icicibank.com",
+            "onlinesbi.sbi",
+            "axisbank.com",
+            "kotak.com",
+            "zerodha.com",
+            "upstox.com",
+            "groww.in",
+            "paytm.com",
+            "phonepe.com",
+            "incometax.gov.in",
+            "billdesk.com",
+            "razorpay.com",
+            "stripe.com"
+        ]
+    },
+    "Govt+allow": {
+        "category": "Govt",
+        "action": "allow",
+        "domains": [
+            "india.gov.in",
+            "uidai.gov.in",
+            "parivahan.gov.in",
+            "epfindia.gov.in",
+            "passportindia.gov.in",
+            "gst.gov.in",
+            "irctc.co.in",
+            "digilocker.gov.in",
+            "nvsp.in",
+            "mca.gov.in",
+            "incometaxindia.gov.in",
+            "rbi.org.in"
+        ]
+    },
+    "Utility+allow": {
+        "category": "Utility",
+        "action": "allow",
+        "domains": [
+            "gmail.com",
+            "outlook.com",
+            "icloud.com",
+            "zoom.us",
+            "slack.com",
+            "drive.google.com",
+            "dropbox.com",
+            "trello.com",
+            "notion.so",
+            "evernote.com",
+            "speedtest.net",
+            "canva.com",
+            "figma.com",
+            "postman.com"
+        ]
+    }
+}

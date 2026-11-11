@@ -1,0 +1,219 @@
+{
+    "EssentialDayToDay+allow": {
+        "category": "EssentialDayToDay",
+        "action": "allow",
+        "terms": [
+            "weather today in bengaluru",
+            "nearest hospital",
+            "how to cook rice",
+            "google maps directions",
+            "latest local news",
+            "time now in india",
+            "nearest hospital directions",
+            "google maps traffic update"
+        ],
+        "history": []
+    },
+    "ShortQueries+allow": {
+        "category": "ShortQueries",
+        "action": "allow",
+        "terms": [
+            "weather",
+            "calculator",
+            "translate",
+            "speed test",
+            "calendar",
+            "pdf to word",
+            "timer 10 minutes",
+            "stopwatch"
+        ],
+        "history": []
+    },
+    "BankingFinance+allow": {
+        "category": "BankingFinance",
+        "action": "allow",
+        "terms": [
+            "sbi online login",
+            "upi transaction failed",
+            "hdfc netbanking",
+            "education loan emi calculator",
+            "check bank balance online",
+            "google pay limit per day"
+        ],
+        "history": []
+    },
+    "GovernmentServices+allow": {
+        "category": "GovernmentServices",
+        "action": "allow",
+        "terms": [
+            "rti online portal karnataka",
+            "directorate of minorities login",
+            "ssp scholarship status",
+            "aadhar card download pdf",
+            "pan card status tracking",
+            "voter id karnataka apply"
+        ],
+        "history": []
+    },
+    "CommuteTransport+allow": {
+        "category": "CommuteTransport",
+        "action": "allow",
+        "terms": [
+            "bmtc student pass renewal",
+            "namma metro timings",
+            "irctc pnr status",
+            "majestic to rvce bus route",
+            "ola cab bengaluru",
+            "uber fare estimate"
+        ],
+        "history": []
+    },
+    "UtilitiesTelecom+allow": {
+        "category": "UtilitiesTelecom",
+        "action": "allow",
+        "terms": [
+            "bescom bill payment online",
+            "jio 5g recharge plans",
+            "hostel wifi login portal",
+            "airtel customer care number",
+            "bwssb water bill"
+        ],
+        "history": []
+    },
+    "ShoppingFood+allow": {
+        "category": "ShoppingFood",
+        "action": "allow",
+        "terms": [
+            "swiggy offers today bengaluru",
+            "zepto grocery delivery",
+            "amazon order tracking",
+            "myntra regular fit mens shirts",
+            "campus mike n shoes price",
+            "flipkart electronics sale"
+        ],
+        "history": []
+    },
+    "EntertainmentMedia+allow": {
+        "category": "EntertainmentMedia",
+        "action": "allow",
+        "terms": [
+            "spotify web player",
+            "bookmyshow bengaluru movies",
+            "live cricket score",
+            "rahgir live concert tickets",
+            "youtube trending india",
+            "animal movie songs download"
+        ],
+        "history": []
+    },
+    "EngineeringResearch+allow": {
+        "category": "EngineeringResearch",
+        "action": "allow",
+        "terms": [
+            "nptel data science syllabus",
+            "verilog hardware modeling",
+            "aeroponics microcontroller",
+            "can bus hardware filtering",
+            "uds dbc bitfield parsing",
+            "lora module range test",
+            "nptel data science course syllabus",
+            "verilog hardware modeling examples",
+            "aeroponics microcontroller firmware",
+            "can bus hardware filtering tutorial"
+        ],
+        "history": [
+            "basic verilog syntax"
+        ]
+    },
+    "TechTroubleshooting+allow": {
+        "category": "TechTroubleshooting",
+        "action": "allow",
+        "terms": [
+            "cloudflare zero trust setup",
+            "next.js localstorage error",
+            "obsidian markdown table",
+            "git push origin master",
+            "re2 regex syntax cloudflare",
+            "vercel deployment failed",
+            "cloudflare zero trust firewall rules",
+            "next.js localstorage caching hydration error",
+            "obsidian markdown table formatting",
+            "git push origin master rejected"
+        ],
+        "history": [
+            "cloudflare gateway setup guide"
+        ]
+    },
+    "HealthAndLifestyle+allow": {
+        "category": "HealthAndLifestyle",
+        "action": "allow",
+        "terms": [
+            "7.5 kg dumbbell split routine",
+            "4-7-8 breathing sleep",
+            "rahgir indie folk chords",
+            "maintenance sets workout",
+            "healthy hostel mess diet"
+        ],
+        "history": []
+    },
+    "DeveloperAndHardwareTools+allow": {
+        "category": "DeveloperAndHardwareTools",
+        "action": "allow",
+        "terms": [
+            "git cli commands cheat sheet",
+            "vscode extensions for c++",
+            "arduino ide serial monitor missing",
+            "digital multimeter continuity test",
+            "oscilloscope baud rate settings",
+            "soldering iron temperature for pcb",
+            "postman api testing tutorial",
+            "docker container prune",
+            "linux chmod 777 meaning"
+        ],
+        "history": []
+    },
+    "OnlineUtilitiesAndWebTools+allow": {
+        "category": "OnlineUtilitiesAndWebTools",
+        "action": "allow",
+        "terms": [
+            "json formatter and validator",
+            "regex tester online",
+            "base64 decoder online",
+            "what is my ip address",
+            "dns propagation checker",
+            "markdown editor online",
+            "crontab guru schedule",
+            "color hex code picker",
+            "epoch unix timestamp converter"
+        ],
+        "history": []
+    },
+    "CyberSecurityAndNetworking+allow": {
+        "category": "CyberSecurityAndNetworking",
+        "action": "allow",
+        "terms": [
+            "wireshark filter by ip",
+            "nmap scan open ports",
+            "ping vs traceroute",
+            "cloudflare dns over https",
+            "tls decryption certificate install",
+            "mac address spoofing windows",
+            "subnet mask calculator",
+            "ssh rsa key generation"
+        ],
+        "history": []
+    },
+    "AIAgentsAndCloudTools+allow": {
+        "category": "AIAgentsAndCloudTools",
+        "action": "allow",
+        "terms": [
+            "gemini api key generation",
+            "vercel edge functions limit",
+            "aws s3 bucket public access",
+            "github actions ci cd pipeline",
+            "google cloud console login",
+            "huggingface open source models"
+        ],
+        "history": []
+    }
+}

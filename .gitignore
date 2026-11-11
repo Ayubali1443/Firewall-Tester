@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Node / Web & Worker
+node_modules/
+worker/.wrangler/
+
+# Rust Validator Build & Compiled Binaries
+target/
+sentinelgate/validator/target/
+sentinelgate/validator/bin/
+sentinelgate/config/_seal_build/
+sentinelgate/config/sg_seal.*
+
+# Desktop Builds & Compiler Artifacts
+dist/
+build/
+*.build/
+*.dist/
+*.onefile-build/
+*.spec
+nuitka-crash-report.xml
+
+# Secrets, DPAPI Vaults & Local Logs/Reports
+.env
+.env.*
+*.dpapi
+*.log
+reports/
+sentinelgate/config/_sealed_cf.py

@@ -1,0 +1,105 @@
+{
+    "Proxies+block": {
+        "category": "Proxies",
+        "action": "block",
+        "ai_target": true,
+        "scope": "slip_through",
+        "description": "Web-based proxies and unblocker portals slipping past DNS categorization.",
+        "domains": [
+            "croxyproxy.com",
+            "croxyproxy.rocks",
+            "blockaway.net",
+            "proxysite.com",
+            "proxyium.com",
+            "4everproxy.com",
+            "proxfree.com",
+            "genmirror.com",
+            "kproxy.com",
+            "hidester.com",
+            "filterbypass.me",
+            "webproxy.to"
+        ]
+    },
+    "CGIProxies+block": {
+        "category": "CGIProxies",
+        "action": "block",
+        "ai_target": true,
+        "scope": "slip_through",
+        "description": "CGI proxy scripts (Glype, PHProxy, MiniProxy), Rammerhead/Ultraviolet hubs, and serverless proxy workers.",
+        "domains": []
+    },
+    "SoftwareMediaDownloaders+block": {
+        "category": "SoftwareMediaDownloaders",
+        "action": "block",
+        "ai_target": true,
+        "scope": "slip_through",
+        "description": "Web-based media rippers, APK/EXE software download portals, and portable-app hubs.",
+        "domains": [
+            "y2mate.com",
+            "savefrom.net",
+            "9xbuddy.org",
+            "snaptik.app",
+            "softonic.com",
+            "uptodown.com",
+            "apkpure.com",
+            "apkmirror.com",
+            "filehippo.com",
+            "getintopc.com"
+        ]
+    },
+    "SearchEngines+block": {
+        "category": "SearchEngines",
+        "action": "block",
+        "ai_target": true,
+        "scope": "slip_through",
+        "description": "Alternate search engines & metasearch frontends bypassing Google SafeSearch.",
+        "domains": [
+            "duckduckgo.com",
+            "bing.com",
+            "yahoo.com",
+            "yandex.com",
+            "baidu.com",
+            "searx.space",
+            "archive.org",
+            "ask.com"
+        ]
+    },
+    "ObscureAdult+block": {
+        "category": "ObscureAdult",
+        "action": "block",
+        "ai_target": true,
+        "scope": "slip_through",
+        "description": "Obscure niche/regional adult domains, leak hubs, and rotating mirror sites missed by Cloudflare Zero Trust.",
+        "domains": [
+            "bunkr.ru",
+            "coomer.su",
+            "kemono.su",
+            "simpcity.su",
+            "fapello.com",
+            "erome.com",
+            "scrolller.com",
+            "missav.ws"
+        ]
+    },
+    "AdultImageHosts+block": {
+        "category": "AdultImageHosts",
+        "action": "block",
+        "ai_target": true,
+        "scope": "slip_through",
+        "description": "Dedicated sole-porn/nude/topless image hosting websites and adult imageboards ONLY (strictly excludes multipurpose CDNs and general cloud image hosts).",
+        "domains": [
+            "imagetwist.com",
+            "imagevenue.com",
+            "pixhost.to",
+            "imx.to",
+            "imgspice.com",
+            "acidimg.cc",
+            "turboimagehost.com",
+            "vipr.im",
+            "pimpandhost.com",
+            "imagebam.com",
+            "rule34.xxx",
+            "gelbooru.com"
+        ]
+    }
+}

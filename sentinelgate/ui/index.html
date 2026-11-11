@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SentinelGate AI</title>
+  <link rel="stylesheet" href="/assets/styles.css" />
+  <script>
+    window.__SG_TOKEN__ = "__SG_SESSION_TOKEN__";
+  </script>
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Left Navigation Sidebar -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 2L4 5v6c0 5.55 3.84 10.74 8 12 4.16-1.26 8-6.45 8-12V5l-8-3z"/>
+            <path d="M9 12l2 2 4-4"/>
+          </svg>
+        </div>
+        <div>
+          <div class="brand-title">SentinelGate AI</div>
+          <div class="brand-sub">Secondary Strict Filter</div>
+        </div>
+      </div>
+
+      <div class="posture-chip">
+        <span class="pulse-dot"></span>
+        <span>BLOCK-ONLY ENFORCED</span>
+      </div>
+
+      <nav class="nav-list">
+        <button class="nav-btn active" data-view="dashboard">
+          <span class="nav-dot cyan"></span>
+          <span>Command Center</span>
+        </button>
+        <button class="nav-btn" data-view="autonomous">
+          <span class="nav-dot emerald"></span>
+          <span>Full Autonomous Run</span>
+        </button>
+        <div class="nav-section-label">PENTESTER (WRITE ENABLED)</div>
+        <button class="nav-btn" data-view="dns">
+          <span class="nav-dot emerald"></span>
+          <span>DNS Domain Shield</span>
+        </button>
+        <button class="nav-btn" data-view="search">
+          <span class="nav-dot emerald"></span>
+          <span>Search &amp; Regex Engine</span>
+        </button>
+        <button class="nav-btn" data-view="ai">
+          <span class="nav-dot violet"></span>
+          <span>AI Slip-Through Hunter</span>
+        </button>
+        <div class="nav-section-label">UPTESTER (READ-ONLY)</div>
+        <button class="nav-btn" data-view="uptester">
+          <span class="nav-dot amber"></span>
+          <span>Uptime &amp; Block Monitor</span>
+        </button>
+        <div class="nav-section-label">SYSTEM &amp; CREDENTIALS</div>
+        <button class="nav-btn" data-view="settings">
+          <span class="nav-dot slate"></span>
+          <span>API Vault &amp; Security</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="lock-item">✓ No Allow-Listing</div>
+        <div class="lock-item">✓ No Policy Deletion</div>
+        <div class="lock-item">✓ Immutable Baseline</div>
+        <div class="lock-item">✓ DPAPI Encrypted Vault</div>
+      </div>
+    </aside>
+
+    <!-- Main Workspace -->
+    <div class="workspace">
+      <header class="topbar">
+        <div>
+          <h1 id="page-title">Command Center</h1>
+          <p id="page-subtitle">Real-time posture, Cloudflare policy sync status, and slip-through enforcement</p>
+        </div>
+        <div class="topbar-badges">
+          <span class="badge badge-lock" title="Allow rules and deletions are compiled out">Strict Block Mode</span>
+          <span id="cf-status-badge" class="badge badge-warn">Cloudflare: Checking...</span>
+          <span id="rust-status-badge" class="badge badge-warn">Rust DFA: Checking...</span>
+        </div>
+      </header>
+
+      <main class="content-scroll">
+        <!-- VIEW 1: COMMAND CENTER -->
+        <section id="view-dashboard" class="view active">
+          <div class="kpi-grid">
+            <div class="kpi-card">
+              <div class="kpi-label">Blocked DNS Domains</div>
+              <div class="kpi-value" id="kpi-dns-domains">--</div>
+              <div class="kpi-meta" id="kpi-dns-cats">-- categories</div>
+            </div>
+            <div class="kpi-card">
+              <div class="kpi-label">Search Base Terms</div>
+              <div class="kpi-value" id="kpi-search-terms">--</div>
+              <div class="kpi-meta" id="kpi-search-cats">-- categories</div>
+            </div>
+            <div class="kpi-card">
+              <div class="kpi-label">Cloudflare Search Regex Rules</div>
+              <div class="kpi-value" id="kpi-cf-search-rules">--</div>
+              <div class="kpi-meta" id="kpi-cf-dns-rule">DNS Policy: --</div>
+            </div>
+            <div class="kpi-card">
+              <div class="kpi-label">Tamper-Proof Integrity</div>
+              <div class="kpi-value ok-text" id="kpi-integrity">--</div>
+              <div class="kpi-meta" id="kpi-compiled-mode">--</div>
+            </div>
+          </div>
+
+          <div class="two-col">
+            <div class="panel">
+              <div class="panel-header">
+                <h2>Targeted Threat Scope</h2>
+                <span class="tag tag-cyan">Zero Redundancy Strategy</span>
+              </div>
+              <p class="muted">
+                Cloudflare Zero Trust &amp; Google SafeSearch handle mainstream pornography and Encrypted DNS, while OS Standard User policies block desktop VPN installs. SentinelGate AI dedicates 100% of its regex and hunting power to slip-through vectors:
+              </p>
+              <ul class="scope-list">
+                <li><strong>Web &amp; CGI Proxies:</strong> Glype, PHProxy, MiniProxy, Rammerhead, Ultraviolet, and serverless worker proxies.</li>
+                <li><strong>Obscure &amp; Regional Adult Slip-Throughs:</strong> Uncategorized mirror hubs, leak aggregators, and obfuscated slang terms.</li>
+                <li><strong>Software &amp; Media Downloaders:</strong> Stream rippers, YouTube/social downloaders, portable EXE/APK download portals.</li>
+              </ul>
+              <div class="btn-row">
+                <button class="btn btn-primary" onclick="switchView('autonomous')">Run Full Autonomous Test</button>
+                <button class="btn btn-secondary" onclick="switchView('ai')">Single AI Hunt</button>
+                <button class="btn btn-secondary" onclick="triggerSearchSync()">Sync Search Regex</button>
+                <button class="btn btn-secondary" onclick="switchView('uptester')">Read-Only Audit</button>
+              </div>
+            </div>
+
+            <div class="panel">
+              <div class="panel-header">
+                <h2>Active Cloudflare Gateway Rules</h2>
+                <button class="btn btn-sm btn-ghost" onclick="refreshOverview()">Refresh</button>
+              </div>
+              <div id="cf-rules-list" class="mini-list">
+                <div class="muted">Loading Cloudflare policy telemetry...</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Recent Background Operations</h2>
+            </div>
+            <div id="recent-jobs-list" class="mini-list">
+              <div class="muted">No operations run in this session yet.</div>
+            </div>
+          </div>
+        </section>
+
+        <!-- VIEW 1B: FULL AUTONOMOUS PIPELINE & FINAL REPORTS -->
+        <section id="view-autonomous" class="view">
+          <div class="two-col">
+            <div class="panel">
+              <div class="panel-header">
+                <h2>Full Autonomous Multi-Hour Pipeline</h2>
+                <span class="tag tag-emerald">Unattended 3-Stage Engine</span>
+              </div>
+              <p class="muted">
+                Runs unattended for hours (prevents Windows idle sleep while active). Automatically rotates across all working Gemini models and backup keys, blocks new threats via Pentester, verifies over-blocking via Read-Only Uptester, and saves a comprehensive Final Report.
+              </p>
+
+              <div class="form-group">
+                <label>Duration Presets</label>
+                <div class="btn-row">
+                  <button class="btn btn-sm btn-secondary" onclick="setAutonomousMinutes(30)">30 Min</button>
+                  <button class="btn btn-sm btn-secondary" onclick="setAutonomousMinutes(60)">1 Hour</button>
+                  <button class="btn btn-sm btn-secondary" onclick="setAutonomousMinutes(120)">2 Hours</button>
+                  <button class="btn btn-sm btn-secondary" onclick="setAutonomousMinutes(240)">4 Hours</button>
+                  <button class="btn btn-sm btn-secondary" onclick="setAutonomousMinutes(480)">8 Hours</button>
+                </div>
+              </div>
+
+              <div class="form-row">
+                <div class="form-group flex-1">
+                  <label for="auto-duration-mins">Total Duration (Minutes) <span id="auto-hours-hint" class="mini-status ok-text">= 2.0 hrs</span></label>
+                  <input type="number" id="auto-duration-mins" value="120" min="1" max="1440" step="1" oninput="updateAutoHoursHint()" />
+                </div>
+              </div>
+
+              <div class="diag-list">
+                <label class="checkbox-label">
+                  <input type="checkbox" id="auto-stage1" checked />
+                  <span><strong>Stage 1 (Pentester):</strong> Test &amp; block more DNS sites + AI slip-through hunt</span>
+                </label>
+                <label class="checkbox-label">
+                  <input type="checkbox" id="auto-stage2" checked />
+                  <span><strong>Stage 2 (Pentester):</strong> AI hunt &amp; block more search terms + regex sync &amp; test</span>
+                </label>
+                <label class="checkbox-label">
+                  <input type="checkbox" id="auto-stage3" checked />
+                  <span><strong>Stage 3 (Uptester Read-Only):</strong> Test blocked items not supposed to be blocked &amp; Final Report</span>
+                </label>
+                <label class="checkbox-label">
+                  <input type="checkbox" id="auto-full-dns" />
+                  <span>Force live re-probe of all cached DNS blocklist entries in Stage 1</span>
+                </label>
+              </div>
+
+              <button class="btn btn-primary full-width" onclick="startAutonomousPipeline()">Run Full Autonomous Test</button>
+            </div>
+
+            <div class="panel">
+              <div class="panel-header">
+                <h2>3-Stage Pipeline Execution Tracker</h2>
+                <span id="auto-stage-badge" class="badge badge-idle">READY</span>
+              </div>
+              <div class="stage-stepper">
+                <div id="step-stage-1" class="stage-step">
+                  <div class="step-num">1</div>
+                  <div>
+                    <div><strong>Stage 1: Test &amp; Block More Sites</strong></div>
+                    <div class="muted">DNS penetration probe + multi-category AI site hunting + Cloudflare <code>automated_block</code></div>
+                  </div>
+                </div>
+                <div id="step-stage-2" class="stage-step">
+                  <div class="step-num">2</div>
+                  <div>
+                    <div><strong>Stage 2: Test &amp; Block More Search Terms</strong></div>
+                    <div class="muted">Multi-category AI keyword hunting + skeleton cleaner + Rust DFA regex sync + live &amp; virtual tests</div>
+                  </div>
+                </div>
+                <div id="step-stage-3" class="stage-step">
+                  <div class="step-num">3</div>
+                  <div>
+                    <div><strong>Stage 3: Over-Block Audit &amp; Final Report</strong></div>
+                    <div class="muted">Read-only Uptester checks essential sites &amp; search queries that should NOT be blocked + saves report</div>
+                  </div>
+                </div>
+              </div>
+              <div id="auto-live-metrics" class="mini-row hidden">
+                <span id="auto-live-metric-text">Running...</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="two-col-asymmetric">
+            <div class="panel">
+              <div class="panel-header">
+                <h2>Saved Final Reports</h2>
+                <button class="btn btn-sm btn-ghost" onclick="loadReportsList()">Refresh</button>
+              </div>
+              <div id="reports-history-list" class="mini-list">
+                <div class="muted">No autonomous reports generated yet.</div>
+              </div>
+            </div>
+
+            <div class="panel">
+              <div class="panel-header">
+                <h2>Final Report Inspector</h2>
+                <button id="btn-export-report" class="btn btn-sm btn-secondary hidden" onclick="downloadCurrentReport()">Export JSON</button>
+              </div>
+              <div id="report-detail-view" class="muted">Select a report or run the Full Autonomous Test to inspect results.</div>
+            </div>
+          </div>
+        </section>
+
+        <!-- VIEW 2: DNS SHIELD (PENTESTER) -->
+        <section id="view-dns" class="view">
+          <div class="two-col-asymmetric">
+            <div class="panel">
+              <div class="panel-header">
+                <h2>Add Domains to Blocklist</h2>
+                <span class="tag tag-emerald">Append-Only • Block-Only</span>
+              </div>
+              <div class="form-group">
+                <label for="dns-add-category">Target Category</label>
+                <select id="dns-add-category"></select>
+              </div>
+              <div class="form-group">
+                <label for="dns-new-category">Or Create New Block Category (optional)</label>
+                <input type="text" id="dns-new-category" placeholder="e.g., ServerlessProxies (auto-suffixed +block)" />
+              </div>
+              <div class="form-group">
+                <label for="dns-add-input">Domains to Block (comma or newline separated)</label>
+                <textarea id="dns-add-input" rows="4" placeholder="proxy-mirror.example&#10;stealth-ripper.net"></textarea>
+              </div>
+              <button class="btn btn-primary full-width" onclick="addDnsDomains()">Add to Immutable Blocklist</button>
+              <div id="dns-add-feedback" class="feedback"></div>
+            </div>
+
+            <div class="panel">
+              <div class="panel-header">
+                <h2>DNS Penetration Testing &amp; Remediation</h2>
+                <span class="tag tag-cyan">Pentester Write Module</span>
+              </div>
+              <div class="form-row">
+                <div class="form-group flex-1">
+                  <label for="dns-test-category">Scope</label>
+                  <select id="dns-test-category">
+                    <option value="">All DNS Block Categories</option>
+                  </select>
+                </div>
+                <div class="form-group checkbox-wrap">
+                  <label class="checkbox-label">
+                    <input type="checkbox" id="dns-auto-remediate" checked />
+                    <span>Auto-Push Failed Domains to Cloudflare</span>
+                  </label>
+                </div>
+              </div>
+              <div class="btn-row">
+                <button class="btn btn-primary" onclick="runDnsPentest(false)">Run Smart Incremental Test</button>
+                <button class="btn btn-warning" onclick="runDnsPentest(true)">Run Complete Penetration Test</button>
+                <button id="btn-dns-remediate-last" class="btn btn-secondary hidden" onclick="remediateLastDns()">Push Failed to Cloudflare</button>
+              </div>
+              <p class="hint">
+                Smart Test skips domains already confirmed in Cloudflare <code>automated_block</code> or previous pass logs. Complete Test force-probes every domain live.
+              </p>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header">
+              <h2>DNS Blocklist Explorer (Read &amp; Append Only)</h2>
+              <input type="search" id="dns-filter-input" class="search-input" placeholder="Filter domains or categories..." oninput="renderDnsCategories()" />
+            </div>
+            <div id="dns-categories-container" class="cat-grid"></div>
+          </div>
+        </section>
+
+        <!-- VIEW 3: SEARCH & REGEX ENGINE (PENTESTER) -->
+        <section id="view-search" class="view">
+          <div class="two-col">
+            <div class="panel">
+              <div class="panel-header">
+                <h2>Add Base Search Keywords</h2>
+                <span class="tag tag-emerald">Append-Only • Block-Only</span>
+              </div>
+              <div class="form-group">
+                <label for="search-add-category">Target Category</label>
+                <select id="search-add-category"></select>
+              </div>
+              <div class="form-group">
+                <label for="search-new-category">Or Create New Block Category (optional)</label>
+                <input type="text" id="search-new-category" placeholder="e.g., MirrorHubs (auto-suffixed +block)" />
+              </div>
+              <div class="form-group">
+                <label for="search-add-input">Clean Base Keywords (comma or newline separated)</label>
+                <textarea id="search-add-input" rows="3" placeholder="glype proxy, ultraviolet unblocker, filecr"></textarea>
+              </div>
+              <div class="btn-row">
+                <button class="btn btn-primary" onclick="addSearchTerms()">Add Base Keywords</button>
+                <button class="btn btn-secondary" onclick="runSkeletonCleanup()">Run Skeleton Deduplicator</button>
+              </div>
+              <div id="search-add-feedback" class="feedback"></div>
+            </div>
+
+            <div class="panel">
+              <div class="panel-header">
+                <h2>Cloudflare Dynamic Regex Sync &amp; Testing</h2>
+                <span class="tag tag-cyan">RE2 + Rust 512KB DFA</span>
+              </div>
+              <div class="btn-row">
+                <button class="btn btn-primary" onclick="triggerSearchSync()">Compile Chunks &amp; Sync to Cloudflare</button>
+                <button class="btn btn-secondary" onclick="loadSearchChunks()">Preview Chunk Packing</button>
+              </div>
+              <hr class="divider" />
+              <div class="form-row">
+                <div class="form-group flex-1">
+                  <label for="search-test-cat">Target Category (Virtual / Real Test)</label>
+                  <select id="search-test-cat">
+                    <option value="">All Categories</option>
+                  </select>
+                </div>
+                <div class="form-group flex-1">
+                  <label for="real-test-mode">Real Traffic Mode (WARP)</label>
+                  <select id="real-test-mode">
+                    <option value="random20">20 Random Terms</option>
+                    <option value="category">Selected Category</option>
+                    <option value="custom">Custom Terms Input</option>
+                    <option value="all">ALL Search Terms</option>
+                  </select>
+                </div>
+              </div>
+              <div class="form-group hidden" id="real-test-custom-wrap">
+                <label for="real-test-custom">Custom Keywords to Test Live</label>
+                <input type="text" id="real-test-custom" placeholder="croxyproxy, y2mate, glype" />
+              </div>
+              <div class="btn-row">
+                <button class="btn btn-warning" onclick="runVirtualPentest()">Run Virtual Brute-Force (800x/term)</button>
+                <button class="btn btn-secondary" onclick="runRealSearchTest()">Run Real Google Traffic Test</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Regex & Rust DFA Sandbox -->
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Live Obfuscation Inspector &amp; Rust DFA Simulator</h2>
+              <span class="tag tag-cyan">Exact Retained CHAR_MAP</span>
+            </div>
+            <div class="form-row">
+              <div class="form-group flex-1">
+                <label for="regex-test-terms">Base Term(s) to Obfuscate</label>
+                <input type="text" id="regex-test-terms" value="web proxy" placeholder="e.g., web proxy, glype" />
+              </div>
+              <div class="form-group flex-1">
+                <label for="regex-sample-query">Test Query Input (Optional Match Check)</label>
+                <input type="text" id="regex-sample-query" value="w3b%20pr0xy" placeholder="e.g., w3b.pr0xy or wb prxy" />
+              </div>
+              <div class="form-group align-end">
+                <button class="btn btn-primary" onclick="previewRegexInspector()">Inspect RE2 + Rust DFA</button>
+              </div>
+            </div>
+            <div id="regex-inspector-output" class="inspector-box hidden"></div>
+            <div id="chunks-preview-box" class="chunks-box hidden"></div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Search Blocklist Categories</h2>
+              <input type="search" id="search-filter-input" class="search-input" placeholder="Filter keywords or categories..." oninput="renderSearchCategories()" />
+            </div>
+            <div id="search-categories-container" class="cat-grid"></div>
+          </div>
+        </section>
+
+        <!-- VIEW 4: AI SLIP-THROUGH HUNTER -->
+        <section id="view-ai" class="view">
+          <div class="two-col">
+            <div class="panel">
+              <div class="panel-header">
+                <h2>On-Demand Gemini Threat Agent</h2>
+                <span class="tag tag-violet">Auto-Failover Enabled</span>
+              </div>
+              <div class="form-row">
+                <div class="form-group flex-1">
+                  <label for="ai-mode">Target Engine</label>
+                  <select id="ai-mode" onchange="populateAiCategories()">
+                    <option value="search">Search Keywords (RE2 Regex Engine)</option>
+                    <option value="dns">DNS Domains (Gateway Hostname List)</option>
+                  </select>
+                </div>
+                <div class="form-group flex-1">
+                  <label for="ai-category">Slip-Through Target Category</label>
+                  <select id="ai-category"></select>
+                </div>
+              </div>
+
+              <div class="form-row">
+                <div class="form-group flex-1">
+                  <label for="ai-duration">Duration (Minutes)</label>
+                  <input type="number" id="ai-duration" value="3" min="0.5" max="120" step="0.5" />
+                </div>
+                <div class="form-group flex-1">
+                  <label for="ai-iterations">Max Iterations</label>
+                  <input type="number" id="ai-iterations" value="5" min="1" max="40" />
+                </div>
+              </div>
+
+              <div class="form-group checkbox-wrap">
+                <label class="checkbox-label">
+                  <input type="checkbox" id="ai-auto-deploy" checked />
+                  <span>Automatically push discovered blocks to Cloudflare (via Pentester)</span>
+                </label>
+              </div>
+
+              <div class="btn-row">
+                <button class="btn btn-secondary" onclick="discoverGeminiModels()">1. Discover &amp; Ping Live Models</button>
+                <button class="btn btn-primary" onclick="startAiHunt()">2. Start Slip-Through Hunt</button>
+              </div>
+            </div>
+
+            <div class="panel">
+              <div class="panel-header">
+                <h2>Verified Gemini Models Queue</h2>
+                <span class="tag tag-cyan">Best Model First</span>
+              </div>
+              <p class="hint">
+                Run model discovery to pre-flight ping live models and populate the failover queue. Legacy desktop-VPN categories are excluded from AI hunting to prevent wasted tokens.
+              </p>
+              <div class="form-group">
+                <label for="ai-model-select">Primary Model</label>
+                <select id="ai-model-select">
+                  <option value="">Auto-Select Best Discovered Model</option>
+                </select>
+              </div>
+              <div id="ai-models-badges" class="pill-wrap">
+                <span class="muted">Click "Discover &amp; Ping Live Models" to test API health.</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- VIEW 5: UPTESTER (READ-ONLY) -->
+        <section id="view-uptester" class="view">
+          <div class="alert-banner amber">
+            <strong>READ-ONLY POLICY LOCK:</strong> The Uptester module can inspect local connectivity and audit Cloudflare rules, but is architecturally blocked from creating, modifying, or deleting any Cloudflare policy or blocklist.
+          </div>
+
+          <div class="two-col">
+            <div class="panel">
+              <div class="panel-header">
+                <h2>Critical Block Enforcement Audit</h2>
+                <span class="tag tag-amber">Read-Only Verification</span>
+              </div>
+              <p class="muted">
+                Verifies that necessary blocked items (Web Proxies, CGI Proxies, Downloaders, Obscure Adult) remain actively blocked. Any slip-through is flagged for Pentester remediation.
+              </p>
+              <div class="form-group">
+                <label for="uptester-block-scope">Audit Scope</label>
+                <select id="uptester-block-scope">
+                  <option value="slip_throughs">High-Priority Slip-Through Categories (Proxies, CGI, Downloaders, Obscure Adult)</option>
+                  <option value="all">Full Blocklist Sample Audit</option>
+                </select>
+              </div>
+              <button class="btn btn-primary" onclick="runUptesterBlockAudit()">Run Block Enforcement Audit</button>
+            </div>
+
+            <div class="panel">
+              <div class="panel-header">
+                <h2>Essential Productivity Baseline Audit</h2>
+                <span class="tag tag-amber">Read-Only Verification</span>
+              </div>
+              <p class="muted">
+                Checks essential daily domains (Tech, Education, Finance, Govt, Utilities) and productivity Google search queries to detect unintentional over-blocking.
+              </p>
+              <div class="form-row">
+                <div class="form-group flex-1">
+                  <label for="uptester-dns-cat">DNS Baseline Category</label>
+                  <select id="uptester-dns-cat">
+                    <option value="">All Essential DNS Categories</option>
+                  </select>
+                </div>
+                <div class="form-group flex-1">
+                  <label for="uptester-search-cat">Search Baseline Category</label>
+                  <select id="uptester-search-cat">
+                    <option value="">All Search Categories (25 sample)</option>
+                  </select>
+                </div>
+              </div>
+              <div class="btn-row">
+                <button class="btn btn-secondary" onclick="runUptesterDnsBaseline(false)">Smart DNS Baseline</button>
+                <button class="btn btn-secondary" onclick="runUptesterDnsBaseline(true)">Full DNS Baseline</button>
+                <button class="btn btn-secondary" onclick="runUptesterSearchBaseline()">Search Baseline Check</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Latest Uptester Audit Findings</h2>
+            </div>
+            <div id="uptester-results-box" class="muted">Run an audit above to inspect enforcement status or essential baseline health.</div>
+          </div>
+        </section>
+
+        <!-- VIEW 6: API VAULT & SECURITY -->
+        <section id="view-settings" class="view">
+          <div class="two-col">
+            <div class="panel">
+              <div class="panel-header">
+                <h2>AI API Key Vault (Windows DPAPI)</h2>
+                <span class="tag tag-emerald">AI Keys Editable Only</span>
+              </div>
+              <p class="hint">
+                Only Gemini AI API keys can be edited here and are sealed using Windows DPAPI (<code>CryptProtectData</code>). Leave any field untouched to keep its current stored value.
+              </p>
+              <div class="form-group">
+                <label for="vault-gemini-primary">Gemini API Key (Primary) <span id="badge-gem-p" class="mini-status"></span></label>
+                <input type="password" id="vault-gemini-primary" autocomplete="off" placeholder="Enter new Gemini API key to update..." />
+              </div>
+              <div class="form-group">
+                <label for="vault-gemini-backup">Gemini API Key (Optional Backup Failover) <span id="badge-gem-b" class="mini-status"></span></label>
+                <input type="password" id="vault-gemini-backup" autocomplete="off" placeholder="Optional fallback Gemini API key..." />
+              </div>
+              <div class="mini-row" style="margin: 4px 0;">
+                <div>
+                  <div><strong>Cloudflare Gateway Credentials</strong></div>
+                  <div class="muted">Sealed &amp; locked inside compiled binary/relay. Permanently hidden and non-editable.</div>
+                </div>
+                <span id="badge-cf-sealed" class="badge badge-lock">SEALED &amp; LOCKED</span>
+              </div>
+              <div class="btn-row">
+                <button class="btn btn-primary" onclick="saveVaultCredentials()">Save AI Keys to DPAPI Vault</button>
+                <button class="btn btn-secondary" onclick="testVaultConnections()">Test AI &amp; Cloudflare Health</button>
+                <button class="btn btn-ghost" onclick="clearBackupGeminiKey()">Clear Backup Key</button>
+              </div>
+              <div id="vault-feedback" class="feedback"></div>
+            </div>
+
+            <div class="panel">
+              <div class="panel-header">
+                <h2>Tamper-Proofing &amp; Architecture Guards</h2>
+                <span class="tag tag-cyan">Active Enforcement</span>
+              </div>
+              <div id="security-diagnostics-box" class="diag-list">
+                <div class="muted">Loading security diagnostics...</div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <!-- Live Background Job Console Drawer -->
+      <section id="job-console" class="job-console">
+        <div class="console-header">
+          <div class="console-title-group">
+            <span id="job-status-pill" class="badge badge-idle">IDLE</span>
+            <strong id="job-title">Ready for operations</strong>
+            <span id="job-progress-text" class="muted"></span>
+          </div>
+          <div class="console-actions">
+            <button id="btn-stop-job" class="btn btn-sm btn-danger hidden" onclick="stopActiveJob()">Stop Operation</button>
+            <button class="btn btn-sm btn-ghost" onclick="clearConsole()">Clear Log</button>
+            <button class="btn btn-sm btn-ghost" onclick="toggleConsoleHeight()">Expand / Collapse</button>
+          </div>
+        </div>
+        <div class="progress-track">
+          <div id="job-progress-bar" class="progress-fill" style="width: 0%;"></div>
+        </div>
+        <pre id="console-output" class="console-log"></pre>
+      </section>
+    </div>
+  </div>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>
