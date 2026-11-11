@@ -25,7 +25,6 @@ $DirTargets = @(
     "main.onefile-build",
     ".pytest_cache",
     "reports",
-    "worker\.wrangler",
     "sentinelgate\config\_seal_build",
     "sentinelgate\validator\target",
     "sentinelgate\validator\bin"

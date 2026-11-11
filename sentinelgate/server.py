@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import ctypes
 import os
 import random
 import secrets
-import sys
 import threading
 import time
 import traceback
@@ -17,8 +15,8 @@ import uuid
 from flask import Flask, jsonify, request, send_from_directory
 
 from sentinelgate import __app_name__, __version__
-from sentinelgate.config.cf_secrets import get_cloudflare_transport_config, is_admin_process
-from sentinelgate.config.paths import get_ui_dir, is_compiled_binary
+from sentinelgate.config.cf_secrets import get_cloudflare_transport_config
+from sentinelgate.config.paths import get_ui_dir
 from sentinelgate.config.vault import ApiKeyVault
 from sentinelgate.core.cleaner import generate_human_variations
 from sentinelgate.core.cloudflare import CloudflareReadOnlyClient
@@ -196,7 +194,6 @@ def create_app(session_token: str | None = None) -> tuple[Flask, str]:
                 "ok": True,
                 "app_name": __app_name__,
                 "version": __version__,
-                "is_admin": is_admin_process(),
                 "integrity": integrity,
                 "validator": {"ok": val_ok, "detail": val_info},
                 "cloudflare": cf_overview,
@@ -207,6 +204,7 @@ def create_app(session_token: str | None = None) -> tuple[Flask, str]:
                     "search_categories": len(search_data),
                     "search_terms": sum(len(v.get("terms", [])) for v in search_data.values()),
                 },
+                "data_dir": str(storage.workspace_data_dir),
                 "recent_jobs": jobs.list_recent(),
             }
         )
@@ -651,23 +649,32 @@ def create_app(session_token: str | None = None) -> tuple[Flask, str]:
             }
         )
 
-    @app.post("/api/system/relaunch-admin")
-    def api_relaunch_admin() -> Any:
-        if is_admin_process():
-            return jsonify({"ok": True, "already_admin": True})
-        if os.name != "nt":
-            return jsonify({"ok": False, "error": "Administrator UAC elevation is only supported on Windows."}), 400
-        exe = sys.executable
-        params = "" if is_compiled_binary() else "-m sentinelgate.main"
-        rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
-        if int(rc) <= 32:
-            return jsonify(
-                {
-                    "ok": False,
-                    "error": "Windows Administrator UAC elevation declined or unavailable.",
-                }
-            ), 403
-        threading.Timer(0.4, os._exit, args=(0,)).start()
-        return jsonify({"ok": True, "relaunching": True})
+    @app.post("/api/storage/open-folder")
+    def api_open_data_folder() -> Any:
+        data_dir = storage.workspace_data_dir
+        data_dir.mkdir(parents=True, exist_ok=True)
+        if os.name == "nt":
+            os.startfile(str(data_dir))
+        return jsonify({"ok": True, "data_dir": str(data_dir)})
+
+    @app.get("/api/storage/json/<filename>")
+    def api_get_editable_json(filename: str) -> Any:
+        try:
+            path, content = storage.read_editable_json_text(filename)
+            return jsonify({"ok": True, "filename": filename, "path": str(path), "content": content})
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+
+    @app.post("/api/storage/json/<filename>")
+    def api_save_editable_json(filename: str) -> Any:
+        payload = request.get_json(force=True) or {}
+        raw_text = str(payload.get("content", ""))
+        try:
+            res = storage.save_editable_json_text(filename, raw_text)
+            return jsonify({"ok": True, **res})
+        except PermissionError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 403
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
 
     return app, token

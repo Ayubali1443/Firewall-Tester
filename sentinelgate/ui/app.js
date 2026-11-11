@@ -7,6 +7,7 @@ const VIEW_META = {
   search: ["Search & Regex Engine", "Pentester module: RE2 obfuscation, Rust 512KB DFA validation, chunking & brute-force testing"],
   ai: ["AI Slip-Through Hunter", "On-demand Gemini threat agent focused strictly on proxies, downloaders & obscure adult slip-throughs"],
   uptester: ["Uptester Monitor (Read-Only)", "Strictly read-only verification of necessary blocks and essential daily uptime baselines"],
+  jsoneditor: ["JSON Files Editor", "Edit installed data/*.json files directly inside the app or Explorer (Cloudflare-deletion safe)"],
   settings: ["API Vault & Security", "Windows DPAPI encrypted credential management and tamper-proof architecture diagnostics"]
 };
 
@@ -16,6 +17,7 @@ let lastDnsRemediationMap = {};
 let activeJobId = null;
 let activeJobSince = 0;
 let jobPollTimer = null;
+let geminiPromptShown = false;
 
 // Harden shell against casual DevTools inspection
 document.addEventListener("contextmenu", (e) => e.preventDefault());
@@ -71,6 +73,7 @@ function switchView(viewId) {
   if (viewId === "search") loadSearchDatasets();
   if (viewId === "ai") populateAiCategories();
   if (viewId === "uptester") loadUptesterDatasets();
+  if (viewId === "jsoneditor") loadSelectedJsonFile();
   if (viewId === "settings") refreshVaultAndSecurity();
 }
 
@@ -105,19 +108,12 @@ async function refreshOverview() {
       : "DNS automated_block: Inactive/Missing";
 
     const cfBadge = document.getElementById("cf-status-badge");
-    const adminBtnTop = document.getElementById("btn-relaunch-admin");
     if (cf.ready) {
       cfBadge.textContent = `Cloudflare Engine: Ready (${cf.total_gateway_rules || 0} Rules)`;
       cfBadge.className = "badge badge-ok";
-      if (adminBtnTop) adminBtnTop.style.display = "none";
-    } else if (cf.admin_locked) {
-      cfBadge.textContent = "Cloudflare API: ADMIN LOCKED";
-      cfBadge.className = "badge badge-lock";
-      if (adminBtnTop) adminBtnTop.style.display = "inline-flex";
     } else {
       cfBadge.textContent = "Cloudflare Engine: Offline";
       cfBadge.className = "badge badge-warn";
-      if (adminBtnTop) adminBtnTop.style.display = "none";
     }
 
     const rustBadge = document.getElementById("rust-status-badge");
@@ -138,9 +134,7 @@ async function refreshOverview() {
 
     const rulesBox = document.getElementById("cf-rules-list");
     if (!cf.ready) {
-      rulesBox.innerHTML = cf.admin_locked
-        ? `<div class="muted">Cloudflare API Locked: Windows Administrator access (UAC) is required to unlock Cloudflare credentials on this desktop.</div>`
-        : `<div class="muted">Cloudflare Engine: Offline</div>`;
+      rulesBox.innerHTML = `<div class="muted">Cloudflare Engine: Offline</div>`;
     } else {
       const items = [];
       const dnsRules = cf.dns_rules || [];
@@ -176,6 +170,12 @@ async function refreshOverview() {
       recentBox.innerHTML = rj
         .map((j) => `<div class="mini-row"><span>${escapeHtml(j.title)}</span><span class="badge badge-${j.status === "completed" ? "ok" : j.status === "running" ? "running" : "warn"}">${escapeHtml(j.status).toUpperCase()}</span></div>`)
         .join("");
+    }
+
+    const gemReady = Boolean(data.vault && data.vault.keys && data.vault.keys.GEMINI_API_KEY && data.vault.keys.GEMINI_API_KEY.configured);
+    if (!gemReady && !geminiPromptShown) {
+      geminiPromptShown = true;
+      openGeminiPromptModal();
     }
   } catch (err) {
     appendConsoleLine(`[Overview Error] ${err.message}`);
@@ -611,18 +611,12 @@ async function refreshVaultAndSecurity() {
   cfSealedBadge.className = "badge badge-lock";
 
   const cf = overview.cloudflare || {};
-  const isAdmin = Boolean(overview.is_admin);
-  const adminBtnSettings = document.getElementById("btn-settings-relaunch-admin");
-  if (adminBtnSettings) {
-    adminBtnSettings.style.display = (!isAdmin && cf.admin_locked) ? "inline-flex" : "none";
-  }
   const integ = overview.integrity || {};
   const val = overview.validator || {};
   const diagBox = document.getElementById("security-diagnostics-box");
   diagBox.innerHTML = [
-    ["Cloudflare API Protection", "Windows Admin/SYSTEM-only ACL + Machine DPAPI (non-editable)", true, "SEALED & LOCKED"],
-    ["Desktop Administrator Gate", isAdmin ? "Elevated Administrator session verified" : "Non-admin / unelevated session — Cloudflare API access blocked", isAdmin, isAdmin ? "ADMIN ACTIVE" : "ADMIN LOCKED"],
-    ["Cloudflare Engine Connectivity", cf.ready ? `Ready (${cf.total_gateway_rules || 0} Gateway Rules)` : (cf.admin_locked ? "Locked — Administrator UAC required" : "Offline"), Boolean(cf.ready), cf.ready ? "READY" : (cf.admin_locked ? "ADMIN LOCKED" : "OFFLINE")],
+    ["Cloudflare API Protection", "Hidden & sealed inside native WinHTTP machine code (non-editable, zero Python token exposure)", true, "SEALED & LOCKED"],
+    ["Cloudflare Engine Connectivity", cf.ready ? `Ready (${cf.total_gateway_rules || 0} Gateway Rules)` : "Offline", Boolean(cf.ready), cf.ready ? "READY" : "OFFLINE"],
     ["AI Key DPAPI Vault", v.vault_encrypted ? "Active (Windows CryptProtectData - AI keys only)" : "Initializing", v.vault_encrypted, v.vault_encrypted ? "SECURE" : "WARN"],
     ["Immutable Baseline Blocklists", `DNS: ${integ.dns_active_count}/${integ.dns_baseline_count} • Search: ${integ.search_active_count}/${integ.search_baseline_count}`, integ.dns_intact && integ.search_intact, (integ.dns_intact && integ.search_intact) ? "SECURE" : "WARN"],
     ["Allow-Listing & Policy Deletion", "Disabled at API, UI & Storage layers", integ.block_only_enforced, integ.block_only_enforced ? "SECURE" : "WARN"],
@@ -637,6 +631,67 @@ async function refreshVaultAndSecurity() {
       <span class="badge ${ok ? "badge-ok" : "badge-warn"}">${escapeHtml(badgeText)}</span>
     </div>
   `).join("");
+
+  const dirEl = document.getElementById("json-data-dir-path");
+  if (dirEl && overview.data_dir) {
+    dirEl.textContent = overview.data_dir;
+  }
+}
+
+async function openDataFolder() {
+  try {
+    const res = await apiFetch("/api/storage/open-folder", { method: "POST" });
+    setFeedback("json-folder-feedback", `Opened editable JSON folder: ${res.data_dir}`, true);
+  } catch (err) {
+    setFeedback("json-folder-feedback", err.message, false);
+  }
+}
+
+async function reloadDatasetsFromJson() {
+  await Promise.all([loadDnsDatasets(), loadSearchDatasets(), loadUptesterCategories(), refreshOverview()]);
+  setFeedback("json-folder-feedback", "Reloaded JSON files cleanly (existing Cloudflare blocks preserved).", true);
+}
+
+async function loadSelectedJsonFile() {
+  const fname = document.getElementById("json-editor-select").value;
+  try {
+    const res = await apiFetch(`/api/storage/json/${encodeURIComponent(fname)}`);
+    document.getElementById("json-editor-filepath").textContent = res.path;
+    document.getElementById("json-editor-textarea").value = res.content;
+    setFeedback("json-editor-feedback", `Loaded ${fname}`, true);
+  } catch (err) {
+    setFeedback("json-editor-feedback", err.message, false);
+  }
+}
+
+function formatJsonEditorText() {
+  const ta = document.getElementById("json-editor-textarea");
+  try {
+    const parsed = JSON.parse(ta.value);
+    ta.value = JSON.stringify(parsed, null, 4);
+    setFeedback("json-editor-feedback", "Formatted JSON cleanly.", true);
+  } catch (err) {
+    setFeedback("json-editor-feedback", `Invalid JSON syntax: ${err.message}`, false);
+  }
+}
+
+async function saveJsonEditorFile() {
+  const fname = document.getElementById("json-editor-select").value;
+  const content = document.getElementById("json-editor-textarea").value;
+  try {
+    const res = await apiFetch(`/api/storage/json/${encodeURIComponent(fname)}`, {
+      method: "POST",
+      body: JSON.stringify({ content }),
+    });
+    setFeedback(
+      "json-editor-feedback",
+      `Saved ${res.filename} (${res.categories} categories, ${res.active_items} active items). Deletions never remove Cloudflare blocks.`,
+      true
+    );
+    await Promise.all([loadDnsDatasets(), loadSearchDatasets(), loadUptesterCategories(), refreshOverview()]);
+  } catch (err) {
+    setFeedback("json-editor-feedback", err.message, false);
+  }
 }
 
 async function saveVaultCredentials() {
@@ -658,19 +713,6 @@ async function clearBackupGeminiKey() {
   await apiFetch("/api/vault/clear-backup", { method: "POST" });
   setFeedback("vault-feedback", "Backup Gemini key cleared.", true);
   await refreshVaultAndSecurity();
-}
-
-async function relaunchAsAdmin() {
-  try {
-    const res = await apiFetch("/api/system/relaunch-admin", { method: "POST" });
-    if (res.already_admin) {
-      await refreshOverview();
-      return;
-    }
-    setFeedback("vault-feedback", "Launching Administrator session via Windows UAC...", true);
-  } catch (err) {
-    setFeedback("vault-feedback", err.message, false);
-  }
 }
 
 async function testVaultConnections() {
@@ -960,6 +1002,45 @@ async function stopActiveJob() {
   if (!activeJobId) return;
   await apiFetch(`/api/jobs/${activeJobId}/stop`, { method: "POST" });
   appendConsoleLine("[!] Stop requested — finishing current check cleanly...");
+}
+
+function openGeminiPromptModal() {
+  const modal = document.getElementById("gemini-setup-modal");
+  if (!modal) return;
+  modal.classList.remove("hidden");
+  const inp = document.getElementById("modal-gemini-primary");
+  if (inp) inp.focus();
+}
+
+function dismissGeminiPromptModal() {
+  const modal = document.getElementById("gemini-setup-modal");
+  if (modal) modal.classList.add("hidden");
+}
+
+async function submitGeminiPromptModal() {
+  const primary = document.getElementById("modal-gemini-primary").value.trim();
+  const backup = document.getElementById("modal-gemini-backup").value.trim();
+  if (!primary) {
+    setFeedback("modal-gemini-feedback", "Please enter your primary Gemini API key.", false);
+    return;
+  }
+  try {
+    setFeedback("modal-gemini-feedback", "Saving to DPAPI Vault & testing Gemini API...", true);
+    await apiFetch("/api/vault/update", {
+      method: "POST",
+      body: JSON.stringify({ GEMINI_API_KEY: primary, GEMINI_API_KEY_BACKUP: backup }),
+    });
+    const testRes = await apiFetch("/api/vault/test", { method: "POST" });
+    if (testRes.gemini_primary && !testRes.gemini_primary.ok) {
+      setFeedback("modal-gemini-feedback", `Saved, but Gemini test reported: ${testRes.gemini_primary.error}`, false);
+    } else {
+      dismissGeminiPromptModal();
+      await refreshOverview();
+      await refreshVaultAndSecurity();
+    }
+  } catch (err) {
+    setFeedback("modal-gemini-feedback", err.message, false);
+  }
 }
 
 // Initial boot

@@ -7,56 +7,69 @@ Secondary Strict Web Filter & On-Demand AI Threat Hunter targeting web proxies, 
 - `sentinelgate/` — Unified desktop application package
   - `main.py` — PyWebView desktop shell (DevTools disabled) & authenticated local bridge
   - `server.py` — Token-protected Flask API & background job runner
-  - `config/cf_secrets.py` — Compile-time multi-layer secret sealing for immutable Cloudflare credentials
+  - `config/cf_secrets.py` — Native Rust WinHTTP secret sealing (`sg_seal.dll`) supporting **Zero-Token Worker Relay** mode (`CF_ACCOUNT_ID` and `CF_API_TOKEN` never touch client PCs), caller HMAC handshake, anti-debugger/hardware-breakpoint detection, `NO_PROXY` TLS with `HCCE_LOCAL_MACHINE` chain validation (blocks `CurrentUser\Root` MITM CAs), volatile heap zeroing, and native block-only policy enforcement
   - `config/vault.py` — Windows DPAPI (`CryptProtectData`) vault for editable AI (Gemini) API keys only
   - `core/regex_engine.py` — Exact retained `CHAR_MAP` obfuscator, dynamic chunker & Rust DFA check
   - `core/cleaner.py` — Skeleton clustering deduplicator & 800x virtual brute-forcer
-  - `core/cloudflare.py` — Separated `CloudflareReadOnlyClient` & `CloudflarePolicyWriter`
-  - `core/gemini_agent.py` — On-demand Gemini slip-through threat hunter with model & backup-key failover
+  - `core/cloudflare.py` — Separated `CloudflareReadOnlyClient` & `CloudflarePolicyWriter` with Zero-Token Worker Relay + full Gateway limit & auto-sharding support
+  - `core/gemini_agent.py` — On-demand Gemini slip-through threat hunter with model, key & saturation auto-stop
   - `core/storage.py` — Immutable baseline + DPAPI overlay append-only blocklist storage
   - `modules/pentester.py` — Block-only policy writer (DNS + Search Pentester)
   - `modules/uptester.py` — Strictly read-only block enforcement & essential baseline monitor
   - `validator/` — Rust `cf_validator` RE2 512KB DFA compiler check
+  - `installer/` — Single-file per-user Rust Windows installer & uninstaller (`SentinelGateAI-Setup.exe`, zero admin required)
   - `ui/` — Embedded HTML/CSS/JS desktop interface
+- `worker/` — **Zero-Token Cloudflare Worker Relay** (`sentinelgate-relay.js`, `wrangler.toml`, `setup-worker.ps1`, [`worker/README.md`](worker/README.md)) so Cloudflare API credentials never ship to client computers
 - `data/` — Consolidated blocklists, uptime baselines, and cached test states
 - `tests/` — Automated verification suite
-- `build.py` — Native executable compiler (`SentinelGateAI.exe` via Nuitka / PyInstaller)
+- `build.py` — **The single build script**: live-tests the deployed Worker Relay, seals `WORKER_URL` + `RELAY_CLIENT_SECRET` into `sg_seal.dll`, compiles via Nuitka (`--onefile`), and produces `dist/SentinelGateAI-Setup.exe`
+- `setup.ps1` — Developer dependency & environment installer (`.venv`, Python packages, Rust `cf_validator.exe`, tests)
+- `clean.ps1` — Removes all regenerable dependencies, caches, and build artifacts
 
-## Single-File Installer & Setup Scripts
+## Scripts
 
-- **Build ONE self-contained Windows Setup file (`dist/SentinelGateAI-Setup.exe`)** embedding the desktop app, UI, Python runtime, Rust `cf_validator.exe`, and sealed Rust `sg_seal.dll` (requires no Python/Rust on target PCs):
-  ```powershell
-  .\setup.ps1 -BuildSetup -SkipCredentials
-  ```
-  When run interactively, `SentinelGateAI-Setup.exe` prompts for Windows Administrator elevation (UAC), asks for **Cloudflare API** + **Gemini AI API** credentials, encrypts Cloudflare credentials via Windows Machine DPAPI + HKLM entropy, and locks `%ProgramData%\SentinelGateAI\AdminLock` and `HKLM\SOFTWARE\SentinelGateAI` exclusively to `SYSTEM` and `BUILTIN\Administrators` so standard/unelevated desktop users cannot access Cloudflare API.
-- **Reinstall dev environment & configure Admin-locked credentials (auto-installs Python/Rust if missing, creates `.venv`, compiles `cf_validator.exe`, runs tests, prompts via UAC for Cloudflare + Gemini APIs)**:
-  ```powershell
-  .\setup.ps1
-  ```
-  *(Pass `-SkipCredentials` for unattended developer setup without credential prompts.)*
-- **Clean all regenerable dependencies & build artifacts (production Git prep)**:
-  ```powershell
-  .\clean.ps1
-  ```
-
-## Running from Source
+### 1. Clean & Reinstall Environment
 
 ```powershell
-python -m sentinelgate.main
+.\clean.ps1
+.\setup.ps1
 ```
 
-## Running Tests
+### 2. Deploy Zero-Token Worker Relay (Keeps Cloudflare Keys Off Client PCs)
+
+See the full step-by-step setup guide at [`worker/README.md`](worker/README.md). Summary:
+
+1. Put `ACCOUNT_ID` and a least-privilege `API_TOKEN` into root `.env` (used only when uploading encrypted Worker Secrets — never bundled into the client `.exe`).
+2. Authenticate Wrangler and deploy the Worker Relay + push all secrets from `.env`:
+   ```powershell
+   npx wrangler login
+   .\worker\setup-worker.ps1
+   ```
+   This deploys `worker/sentinelgate-relay.js`, uploads `CF_ACCOUNT_ID`, `CF_API_TOKEN`, and `RELAY_CLIENT_SECRET` as encrypted Cloudflare Worker Secrets, and saves `WORKER_URL` & `RELAY_CLIENT_SECRET` into `.env`.
+
+### 3. Build Single-File Installer (`dist/SentinelGateAI-Setup.exe`)
+
+There is one single build script ([`build.py`](build.py)) and it requires **no interactive prompts**. Once `WORKER_URL` and `RELAY_CLIENT_SECRET` are populated in `.env`, run:
 
 ```powershell
-python -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe build.py
 ```
 
-## Compiling Tamper-Proof Desktop Binary
+Before compiling, `build.py` reads `WORKER_URL` and `RELAY_CLIENT_SECRET` from `.env`, live-tests `/v1/health` (and verifies unauthenticated callers get `401`), seals only the Worker Relay endpoint + relay key inside stripped native Rust WinHTTP machine code (`sg_seal.dll`) while leaving `ACCOUNT_ID` and `API_TOKEN` off client builds completely, compiles the desktop shell via Nuitka (`--onefile`), verifies no plaintext secrets exist in the output binary, and outputs `dist/SentinelGateAI-Setup.exe` (zero admin privileges needed). The **Gemini AI API key** is requested only after opening SentinelGate AI and saved per-user in Windows DPAPI.
 
-Set `CF_ACCOUNT_ID` and `CF_API_TOKEN` in your build environment (or enter them when prompted by `build.py`), then compile:
+### 4. Installing, Editing JSONs & Uninstalling
+
+- **Install**: Run `dist\SentinelGateAI-Setup.exe`. It installs `SentinelGateAI.exe` and `Uninstall.exe` to `%LOCALAPPDATA%\Programs\SentinelGateAI`, initializes `%LOCALAPPDATA%\Programs\SentinelGateAI\data\*.json`, ensures WebView2 Runtime is available, creates Desktop & Start Menu shortcuts (including **Uninstall SentinelGate AI**), and registers standard **Windows Installed Apps** uninstall metadata.
+- **Edit JSON Files in Production**: Use the built-in **JSON Files Editor** tab inside SentinelGate AI, or open `%LOCALAPPDATA%\Programs\SentinelGateAI\data\` in Explorer (**API Vault & Security → Open JSON Data Folder**) to edit `dns_blocklist.json`, `search_blocklist.json`, `dns_uptime_sites.json`, or `search_uptime_terms.json`. Adding items enables them immediately; deleting entries from JSON never removes existing blocks from Cloudflare.
+- **Uninstall**: Uninstall anytime via **Windows Settings → Apps → Installed apps → SentinelGate AI → Uninstall**, via the Start Menu **Uninstall SentinelGate AI** shortcut, or by running:
+  ```powershell
+  "%LOCALAPPDATA%\Programs\SentinelGateAI\Uninstall.exe" --uninstall
+  ```
+
+## Running from Source & Tests
 
 ```powershell
-python build.py --backend nuitka
+.\.venv\Scripts\python.exe -m sentinelgate.main
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-`build.py` seals the Cloudflare credentials into obfuscated integer tables compiled natively into machine code inside `dist/SentinelGateAI.exe` and removes all transient secret files from disk. Only Gemini AI API keys remain editable at runtime.

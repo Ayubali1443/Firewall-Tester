@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import json as _json
 import re
 import time
 from typing import Any, Callable
+from urllib.parse import urlencode
 
 import certifi
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from sentinelgate.config.cf_secrets import CloudflareTransportConfig
+from sentinelgate.config.cf_secrets import CloudflareTransportConfig, execute_sealed_request
 
 # Documented Cloudflare Zero Trust Gateway Account Quotas & Limits
 CF_MAX_LISTS_PER_ACCOUNT = 100
@@ -48,10 +50,21 @@ def _build_session(auth_headers: dict[str, str]) -> requests.Session:
     return session
 
 
+class _NativeResponse:
+    """Minimal requests.Response-compatible wrapper for sealed native WinHTTP responses."""
+
+    def __init__(self, status_code: int, text: str) -> None:
+        self.status_code = status_code
+        self.text = text
+
+    def json(self) -> Any:
+        return _json.loads(self.text)
+
+
 class CloudflareReadOnlyClient:
     """Strictly READ-ONLY Cloudflare Gateway client (used by Uptester and status dashboards).
 
-    Supports paginated reads, quota telemetry, Zero-Token Worker Relay mode, and Direct Sealed mode.
+    Supports Zero-Token Worker Relay mode, Direct mode, and Native WinHTTP Sealed mode.
     Exposes zero write, create, patch, put, or delete methods.
     """
 
@@ -78,7 +91,17 @@ class CloudflareReadOnlyClient:
         self.worker_url = cfg.worker_url.rstrip("/")
         self.worker_token = cfg.worker_token
 
-        if self.mode == "worker":
+        if self.mode == "native_worker":
+            self.lists_url = "/lists"
+            self.rules_url = "/rules"
+            self.health_url = "/health"
+            self._session = _build_session({})
+        elif self.mode == "native_sealed":
+            self.lists_url = "/lists"
+            self.rules_url = "/rules"
+            self.health_url = "/rules?per_page=1"
+            self._session = _build_session({})
+        elif self.mode == "worker":
             self.lists_url = f"{self.worker_url}/v1/lists"
             self.rules_url = f"{self.worker_url}/v1/rules"
             self.health_url = f"{self.worker_url}/v1/health"
@@ -94,11 +117,31 @@ class CloudflareReadOnlyClient:
             self.health_url = ""
             self._session = _build_session({})
 
+    @property
+    def _is_native(self) -> bool:
+        return self.mode in ("native_worker", "native_sealed")
+
     def is_configured(self) -> bool:
         return self._cfg.is_ready()
 
-    def is_admin_locked(self) -> bool:
-        return self._cfg.is_admin_locked()
+    def _sealed_http(self, method: str, url: str, params: dict[str, Any] | None = None, json_body: Any = None) -> _NativeResponse:
+        rel_path = url
+        if params:
+            sep = "&" if "?" in rel_path else "?"
+            rel_path = f"{rel_path}{sep}{urlencode(params)}"
+        last_res: _NativeResponse | None = None
+        for attempt in range(5):
+            st, txt = execute_sealed_request(method, rel_path, json_body=json_body)
+            last_res = _NativeResponse(st, txt)
+            if st not in (429, 500, 502, 503, 504) or attempt == 4:
+                return last_res
+            time.sleep(min(8.0, float(2 ** attempt)))
+        return last_res  # pragma: no cover
+
+    def _http_get(self, url: str, params: dict[str, Any] | None = None, timeout: float = 15.0) -> Any:
+        if self._is_native:
+            return self._sealed_http("GET", url, params=params)
+        return self._session.get(url, params=params, timeout=timeout)
 
     def _redact(self, text: str) -> str:
         msg = str(text or "")
@@ -119,7 +162,7 @@ class CloudflareReadOnlyClient:
         items: list[dict[str, Any]] = []
         page = 1
         while page <= 20:
-            res = self._session.get(base_url, params={"page": page, "per_page": 100}, timeout=timeout)
+            res = self._http_get(base_url, params={"page": page, "per_page": 100}, timeout=timeout)
             if res.status_code != 200:
                 break
             body = res.json()
@@ -134,19 +177,18 @@ class CloudflareReadOnlyClient:
         return items
 
     def verify_connection(self) -> dict[str, Any]:
-        if self.is_admin_locked():
-            return {
-                "ok": False,
-                "admin_locked": True,
-                "error": "Administrator access on this desktop is required to unlock Cloudflare API.",
-            }
         if not self.is_configured():
-            return {"ok": False, "admin_locked": False, "error": "Cloudflare engine is offline."}
+            return {"ok": False, "error": "Cloudflare engine is offline."}
         try:
-            res = self._session.get(self.health_url, timeout=8)
-            if self.mode == "worker":
-                if res.status_code == 200 and res.json().get("ok"):
-                    return {"ok": True, "rule_count": res.json().get("rule_count", 0)}
+            res = self._http_get(self.health_url, timeout=8)
+            if self.mode in ("worker", "native_worker"):
+                body = res.json() if res.status_code == 200 else {}
+                if res.status_code == 200 and body.get("ok"):
+                    return {
+                        "ok": True,
+                        "rule_count": int(body.get("rule_count") or 0),
+                        "list_count": int(body.get("list_count") or 0),
+                    }
                 return {"ok": False, "error": self._redact(f"HTTP {res.status_code}: {res.text[:220]}")}
             if res.status_code == 200 and res.json().get("success"):
                 rules = self.get_rules()
@@ -180,7 +222,7 @@ class CloudflareReadOnlyClient:
     def get_existing_list_items(self, list_id: str) -> set[str]:
         if not self.is_configured():
             return set()
-        res = self._session.get(f"{self.lists_url}/{list_id}", timeout=15)
+        res = self._http_get(f"{self.lists_url}/{list_id}", timeout=15)
         if res.status_code == 200:
             items = (res.json().get("result") or {}).get("items") or []
             return set(item["value"] for item in items if "value" in item)
@@ -271,7 +313,6 @@ class CloudflareReadOnlyClient:
         if not self.is_configured():
             return {
                 "ready": False,
-                "admin_locked": self.is_admin_locked(),
                 "dns_rule_active": False,
                 "dns_rules": [],
                 "search_rules": [],
@@ -305,7 +346,6 @@ class CloudflareReadOnlyClient:
             ]
             return {
                 "ready": True,
-                "admin_locked": False,
                 "dns_rule_active": any(r["enabled"] for r in dns_rules),
                 "dns_rules": dns_rules,
                 "search_rules": search_rules,
@@ -315,7 +355,6 @@ class CloudflareReadOnlyClient:
         except Exception as exc:
             return {
                 "ready": False,
-                "admin_locked": False,
                 "error": self._redact(str(exc)),
                 "dns_rule_active": False,
                 "dns_rules": [],
@@ -333,6 +372,12 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
     - Automatically shards lists across _p2/_p3 when exceeding per-list limits (1000/5000).
     - Automatically splits DNS & Search rules across 4090-char policy boundaries atomically.
     """
+
+    def _http_write(self, method: str, url: str, json_body: Any = None, timeout: float = 20.0) -> Any:
+        if self._is_native:
+            return self._sealed_http(method, url, json_body=json_body)
+        fn = getattr(self._session, method.lower())
+        return fn(url, timeout=timeout) if json_body is None else fn(url, json=json_body, timeout=timeout)
 
     @staticmethod
     def _part_sort_key(name: str) -> tuple[int, str]:
@@ -356,7 +401,7 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
             "type": "HOSTNAME",
             "description": "Auto-generated blocklist by SentinelGate AI Pentester",
         }
-        res = self._session.post(self.lists_url, json=payload, timeout=15)
+        res = self._http_write("POST", self.lists_url, json_body=payload, timeout=15)
         if res.status_code == 200 and res.json().get("success"):
             return res.json()["result"]["id"]
         return None
@@ -376,7 +421,7 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
         for i in range(0, len(new_domains), CF_LIST_APPEND_BATCH):
             batch = new_domains[i : i + CF_LIST_APPEND_BATCH]
             payload = {"append": [{"value": d} for d in batch]}
-            res = self._session.patch(f"{self.lists_url}/{list_id}", json=payload, timeout=20)
+            res = self._http_write("PATCH", f"{self.lists_url}/{list_id}", json_body=payload, timeout=20)
             if res.status_code == 200 and res.json().get("success"):
                 pushed += len(batch)
                 if log_cb:
@@ -485,7 +530,7 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
         for i in range(0, len(domains), CF_LIST_APPEND_BATCH):
             batch = domains[i : i + CF_LIST_APPEND_BATCH]
             payload = {"append": [{"value": d} for d in batch]}
-            res = self._session.patch(f"{self.lists_url}/{list_id}", json=payload, timeout=20)
+            res = self._http_write("PATCH", f"{self.lists_url}/{list_id}", json_body=payload, timeout=20)
             if res.status_code == 200 and res.json().get("success"):
                 pushed += len(batch)
                 if log_cb:
@@ -514,12 +559,19 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
             key=self._rule_sort_key,
         )
 
-        # Collect ALL sharded lists belonging to active block categories (e.g., Proxies+block, Proxies+block_p2)
+        # Collect ALL sharded lists belonging to active block categories AND preserve any
+        # existing Cloudflare +block list bindings so JSON deletions NEVER unbind lists from Cloudflare.
         active_bases = [name for name, cfg in dns_data.items() if cfg.get("action") == "block"]
         list_ids_for_block: list[str] = []
         seen_ids: set[str] = set()
+        for existing_r in existing_dns_rules:
+            for existing_lid in re.findall(r"\$([a-f0-9\-]{36})", existing_r.get("traffic") or ""):
+                if existing_lid not in seen_ids:
+                    seen_ids.add(existing_lid)
+                    list_ids_for_block.append(existing_lid)
         for cf_name in sorted(cf_lists.keys(), key=self._part_sort_key):
-            if any(cf_name == b or cf_name.startswith(f"{b}_p") for b in active_bases):
+            is_managed_block_list = "+block" in cf_name
+            if is_managed_block_list or any(cf_name == b or cf_name.startswith(f"{b}_p") for b in active_bases):
                 lid = cf_lists[cf_name]
                 if lid not in seen_ids:
                     seen_ids.add(lid)
@@ -583,9 +635,9 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
 
             try:
                 if target_rule:
-                    res = self._session.put(f"{self.rules_url}/{target_rule['id']}", json=payload, timeout=20)
+                    res = self._http_write("PUT", f"{self.rules_url}/{target_rule['id']}", json_body=payload, timeout=20)
                 else:
-                    res = self._session.post(self.rules_url, json=payload, timeout=20)
+                    res = self._http_write("POST", self.rules_url, json_body=payload, timeout=20)
                 if res.status_code == 200 and res.json().get("success") is True:
                     active_ids.append(res.json()["result"]["id"])
                 else:
@@ -597,7 +649,7 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
         if not errors and len(active_ids) == total_parts and existing_dns_rules:
             for leftover in existing_dns_rules:
                 if leftover.get("id") not in active_ids:
-                    self._session.delete(f"{self.rules_url}/{leftover['id']}", timeout=15)
+                    self._http_write("DELETE", f"{self.rules_url}/{leftover['id']}", timeout=15)
 
         ok = len(errors) == 0 and len(active_ids) == total_parts
         if log_cb:
@@ -717,9 +769,9 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
 
             try:
                 if target_rule:
-                    res = self._session.put(f"{self.rules_url}/{target_rule['id']}", json=payload, timeout=20)
+                    res = self._http_write("PUT", f"{self.rules_url}/{target_rule['id']}", json_body=payload, timeout=20)
                 else:
-                    res = self._session.post(self.rules_url, json=payload, timeout=20)
+                    res = self._http_write("POST", self.rules_url, json_body=payload, timeout=20)
 
                 if res.status_code != 200 or res.json().get("success") is not True:
                     msg = self._redact(f"Chunk {part_index} API Error: {res.text[:220]}")
@@ -770,7 +822,7 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
                     if log_cb:
                         log_cb(f"  [-] Deleting obsolete trailing rule {leftover_rule.get('name')} ({idx_del}/{len(leftovers)})...")
                     try:
-                        del_res = self._session.delete(f"{self.rules_url}/{leftover_rule['id']}", timeout=15)
+                        del_res = self._http_write("DELETE", f"{self.rules_url}/{leftover_rule['id']}", timeout=15)
                         if del_res.status_code == 200:
                             cleaned_obsolete += 1
                         emit_phase(

@@ -59,6 +59,10 @@
           <span>Uptime &amp; Block Monitor</span>
         </button>
         <div class="nav-section-label">SYSTEM &amp; CREDENTIALS</div>
+        <button class="nav-btn" data-view="jsoneditor">
+          <span class="nav-dot cyan"></span>
+          <span>JSON Files Editor</span>
+        </button>
         <button class="nav-btn" data-view="settings">
           <span class="nav-dot slate"></span>
           <span>API Vault &amp; Security</span>
@@ -83,7 +87,6 @@
         <div class="topbar-badges">
           <span class="badge badge-lock" title="Allow rules and deletions are compiled out">Strict Block Mode</span>
           <span id="cf-status-badge" class="badge badge-warn">Cloudflare: Checking...</span>
-          <button id="btn-relaunch-admin" class="btn btn-sm btn-secondary" style="display:none" onclick="relaunchAsAdmin()">Unlock Admin (UAC)</button>
           <span id="rust-status-badge" class="badge badge-warn">Rust DFA: Checking...</span>
         </div>
       </header>
@@ -590,14 +593,13 @@
               <div class="mini-row" style="margin: 4px 0;">
                 <div>
                   <div><strong>Cloudflare Gateway Credentials</strong></div>
-                  <div class="muted">Locked to Windows Administrators &amp; SYSTEM only. Hidden, non-editable, and inaccessible without Administrator access.</div>
+                  <div class="muted">Sealed &amp; locked inside stripped native machine code. Zero token export, anti-debug &amp; direct TLS enforced.</div>
                 </div>
                 <span id="badge-cf-sealed" class="badge badge-lock">SEALED &amp; LOCKED</span>
               </div>
               <div class="btn-row">
                 <button class="btn btn-primary" onclick="saveVaultCredentials()">Save AI Keys to DPAPI Vault</button>
                 <button class="btn btn-secondary" onclick="testVaultConnections()">Test AI &amp; Cloudflare Health</button>
-                <button id="btn-settings-relaunch-admin" class="btn btn-secondary" style="display:none" onclick="relaunchAsAdmin()">Unlock Cloudflare (Admin UAC)</button>
                 <button class="btn btn-ghost" onclick="clearBackupGeminiKey()">Clear Backup Key</button>
               </div>
               <div id="vault-feedback" class="feedback"></div>
@@ -612,6 +614,57 @@
                 <div class="muted">Loading security diagnostics...</div>
               </div>
             </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Editable JSON Datasets (Post-Install Add-Only)</h2>
+              <span class="tag tag-emerald">Append-Safe</span>
+            </div>
+            <p class="hint">
+              Edit <code>dns_blocklist.json</code>, <code>search_blocklist.json</code>, <code>dns_uptime_sites.json</code>, or <code>search_uptime_terms.json</code> in <code id="json-data-dir-path">data/</code> anytime after installation to add more blocks or uptime checks. Removing entries from JSON files never removes existing protections from Cloudflare.
+            </p>
+            <div class="btn-row">
+              <button class="btn btn-primary" onclick="switchView('jsoneditor')">Open Built-In JSON Editor</button>
+              <button class="btn btn-secondary" onclick="openDataFolder()">Open JSON Data Folder</button>
+              <button class="btn btn-ghost" onclick="reloadDatasetsFromJson()">Reload JSON Files</button>
+            </div>
+            <div id="json-folder-feedback" class="feedback"></div>
+          </div>
+        </section>
+
+        <!-- VIEW 7: BUILT-IN JSON EDITOR (POST-INSTALL ADD-ONLY SAFE) -->
+        <section id="view-jsoneditor" class="view">
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Post-Install JSON Dataset Editor</h2>
+              <span class="tag tag-emerald">Deleting Items Never Removes Cloudflare Blocks</span>
+            </div>
+            <p class="hint">
+              Edit JSON datasets directly below or open <code id="json-editor-filepath">data/</code> in Explorer. Adding items updates active datasets immediately; deleting items from JSON never removes existing protections from Cloudflare.
+            </p>
+            <div class="form-row">
+              <div class="form-group flex-1">
+                <label for="json-editor-select">Select JSON File</label>
+                <select id="json-editor-select" onchange="loadSelectedJsonFile()">
+                  <option value="dns_blocklist.json">dns_blocklist.json (DNS Blocked Domains)</option>
+                  <option value="search_blocklist.json">search_blocklist.json (HTTP Search Terms)</option>
+                  <option value="dns_uptime_sites.json">dns_uptime_sites.json (Essential Uptime Domains)</option>
+                  <option value="search_uptime_terms.json">search_uptime_terms.json (Essential Uptime Queries)</option>
+                </select>
+              </div>
+            </div>
+            <div class="form-group">
+              <label for="json-editor-textarea">JSON Content</label>
+              <textarea id="json-editor-textarea" rows="18" style="font-family: Consolas, monospace; font-size: 12px; width: 100%;"></textarea>
+            </div>
+            <div class="btn-row">
+              <button class="btn btn-primary" onclick="saveJsonEditorFile()">Save JSON Changes</button>
+              <button class="btn btn-secondary" onclick="formatJsonEditorText()">Format JSON</button>
+              <button class="btn btn-secondary" onclick="openDataFolder()">Open Folder in Explorer</button>
+              <button class="btn btn-ghost" onclick="loadSelectedJsonFile()">Reload from Disk</button>
+            </div>
+            <div id="json-editor-feedback" class="feedback"></div>
           </div>
         </section>
       </main>
@@ -636,6 +689,32 @@
         </div>
         <pre id="console-output" class="console-log"></pre>
       </section>
+    </div>
+  </div>
+
+  <!-- First-Launch Gemini API Onboarding Modal (Asked only after opening the app) -->
+  <div id="gemini-setup-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <div class="panel-header">
+        <h2>Gemini AI API Key Setup</h2>
+        <span class="badge badge-lock">DPAPI Encrypted</span>
+      </div>
+      <p class="muted">
+        Cloudflare protection is already sealed in native code. Enter your Google Gemini API key below to enable AI slip-through hunting &amp; autonomous scans.
+      </p>
+      <div class="form-group">
+        <label for="modal-gemini-primary">Gemini API Key (Primary)</label>
+        <input type="password" id="modal-gemini-primary" autocomplete="off" placeholder="AIza..." />
+      </div>
+      <div class="form-group">
+        <label for="modal-gemini-backup">Backup Gemini API Key (Optional)</label>
+        <input type="password" id="modal-gemini-backup" autocomplete="off" placeholder="Optional failover Gemini API key..." />
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" onclick="submitGeminiPromptModal()">Verify &amp; Save Gemini Key</button>
+        <button class="btn btn-ghost" onclick="dismissGeminiPromptModal()">Later</button>
+      </div>
+      <div id="modal-gemini-feedback" class="feedback"></div>
     </div>
   </div>
 

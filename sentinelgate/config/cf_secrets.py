@@ -1,291 +1,136 @@
-"""Native Rust/C binary secret sealing & zero-token Worker transport resolver.
+"""Hardened Native Rust Machine-Code Secret Sealing & WinHTTP Transport Engine.
 
 Security Architecture:
-- Supports two production sealing modes inside stripped native machine code (`sg_seal.dll`):
-  1. Zero-Token Cloudflare Worker Mode (`mode = 2`):
-     Only the Worker relay URL + block-only relay secret live in native code.
-     CF_ACCOUNT_ID and CF_API_TOKEN NEVER exist on the user's PC at all.
-  2. Direct Native Sealed Mode (`mode = 1`):
-     Cloudflare credentials are split across shuffled, keystream-encrypted byte tables
-     inside stripped native Rust machine code with anti-debugger detection and
-     volatile memory zeroing (`write_volatile`).
-- In compiled builds, disk vaults and environment variables are strictly ignored.
+- Direct Native Sealed Mode (`sg_seal.dll`):
+  Cloudflare credentials are split across per-byte randomized non-linear byte tables
+  with SHA-256 keystreams inside stripped native Rust machine code.
+  All HTTPS requests to `api.cloudflare.com` run directly from native Rust via
+  `winhttp.dll` (`WINHTTP_ACCESS_TYPE_NO_PROXY`).
+  `ACCOUNT_ID` and `API_TOKEN` NEVER enter Python memory or Python objects in compiled builds.
+- Protections against technical extraction & reverse engineering:
+  - Zero credential-getter exports on `sg_seal.dll` (`sg_unseal_slot` absent).
+  - Per-build PID-bound HMAC-SHA256 caller handshake compiled into Nuitka C extension
+    (`_seal_hash.py`) prevents external callers from using a copied `sg_seal.dll`.
+  - Native anti-debugger detection (`IsDebuggerPresent`, `CheckRemoteDebuggerPresent`,
+    x64 hardware debug registers `Dr0..Dr3`) wipes stack secrets immediately.
+  - Native WinHTTP bypasses user/system proxies and verifies server cert Issuer/Subject
+    before sending any secret headers (blocks local Fiddler/mitmproxy/Burp MITM).
+  - Native block-only JSON/path policy guard rejects allow-listing, disables, list
+    removals, or non-trailing rule deletions directly inside Rust machine code.
 """
 
 from __future__ import annotations
 
 import ctypes
-from ctypes import wintypes
 from dataclasses import dataclass
-import getpass
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
 import secrets
-import sys
 from typing import Any
+from urllib.parse import urlparse
 
-from sentinelgate.config._seal_hash import EXPECTED_SEAL_DLL_SHA256
-from sentinelgate.config.paths import get_bundle_root, is_compiled_binary
-from sentinelgate.config.vault import (
-    ApiKeyVault,
-    dpapi_protect,
-    dpapi_unprotect,
-    save_gemini_install_seed,
+from dotenv import dotenv_values
+
+from sentinelgate.config._seal_hash import (
+    EXPECTED_SEAL_DLL_SHA256,
+    SEAL_PART_A,
+    SEAL_PART_B,
 )
+from sentinelgate.config.paths import get_bundle_root, get_project_root, is_compiled_binary
 
 _FIXED_SLOT_LEN = 256
-_CF_ADMIN_HKLM_SUBKEY = r"SOFTWARE\SentinelGateAI"
-_CF_ADMIN_ENTROPY_PREFIX = b"SentinelGateAI::CF_ADMIN::v1"
-_CF_ADMIN_DIR_SDDL = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
-_CF_ADMIN_FILE_SDDL = "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
-_CF_ADMIN_REG_SDDL = "D:P(A;OICI;KA;;;SY)(A;OICI;KA;;;BA)"
-_SE_FILE_OBJECT = 1
-_SE_REGISTRY_KEY = 4
-_OWNER_SECURITY_INFORMATION = 0x00000001
-_DACL_SECURITY_INFORMATION = 0x00000004
-_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
 
 
 @dataclass(frozen=True)
 class CloudflareTransportConfig:
-    mode: str  # "worker", "direct", "admin_locked", or "none"
+    mode: str  # "native_worker", "native_sealed", "worker", "direct", or "none"
     account_id: str = ""
     api_token: str = ""
     worker_url: str = ""
     worker_token: str = ""
 
     def is_ready(self) -> bool:
+        if self.mode in ("native_worker", "native_sealed"):
+            return True
         if self.mode == "worker":
             return bool(self.worker_url and self.worker_token)
         if self.mode == "direct":
             return bool(self.account_id and self.api_token)
         return False
 
-    def is_admin_locked(self) -> bool:
-        return self.mode == "admin_locked"
+
+def read_cf_from_env_or_dotenv(root_dir: Path | None = None) -> tuple[str, str]:
+    """Read Cloudflare ACCOUNT_ID & API_TOKEN from process env or `.env` (Worker Secrets setup only)."""
+    acct = (os.environ.get("CF_ACCOUNT_ID") or os.environ.get("ACCOUNT_ID") or "").strip()
+    tok = (os.environ.get("CF_API_TOKEN") or os.environ.get("API_TOKEN") or "").strip()
+    if acct and tok:
+        return acct, tok
+
+    env_path = (root_dir or get_project_root()) / ".env"
+    if env_path.exists():
+        vals = dotenv_values(env_path)
+        if not acct:
+            acct = str(vals.get("CF_ACCOUNT_ID") or vals.get("ACCOUNT_ID") or "").strip()
+        if not tok:
+            tok = str(vals.get("CF_API_TOKEN") or vals.get("API_TOKEN") or "").strip()
+    return acct, tok
 
 
-def is_admin_process() -> bool:
-    """Return True when the current process holds Windows Administrator privileges."""
-    if os.name == "nt":
-        try:
-            return bool(ctypes.windll.shell32.IsUserAnAdmin())
-        except Exception:
-            return False
-    return hasattr(os, "geteuid") and os.geteuid() == 0
+def read_worker_from_env_or_dotenv(root_dir: Path | None = None) -> tuple[str, str]:
+    """Read WORKER_URL & RELAY_CLIENT_SECRET from process env or `.env`."""
+    wurl = (
+        os.environ.get("WORKER_URL")
+        or os.environ.get("SG_WORKER_URL")
+        or os.environ.get("RELAY_URL")
+        or ""
+    ).strip()
+    wsec = (
+        os.environ.get("RELAY_CLIENT_SECRET")
+        or os.environ.get("SG_WORKER_TOKEN")
+        or os.environ.get("WORKER_TOKEN")
+        or ""
+    ).strip()
+    if not (wurl and wsec):
+        env_path = (root_dir or get_project_root()) / ".env"
+        if env_path.exists():
+            vals = dotenv_values(env_path)
+            if not wurl:
+                wurl = str(
+                    vals.get("WORKER_URL")
+                    or vals.get("SG_WORKER_URL")
+                    or vals.get("RELAY_URL")
+                    or ""
+                ).strip()
+            if not wsec:
+                wsec = str(
+                    vals.get("RELAY_CLIENT_SECRET")
+                    or vals.get("SG_WORKER_TOKEN")
+                    or vals.get("WORKER_TOKEN")
+                    or ""
+                ).strip()
+    return wurl.rstrip("/"), wsec
 
 
-def get_admin_cf_dir() -> Path:
-    """Return shared Admin-locked ProgramData directory for Cloudflare credentials."""
-    prog_data = os.environ.get("ProgramData") or r"C:\ProgramData"
-    return Path(prog_data) / "SentinelGateAI" / "AdminLock"
+def derive_build_handshake_parts(handshake_key: bytes) -> tuple[bytes, bytes]:
+    """Split a 32-byte per-build handshake secret into XOR-obfuscated Nuitka-compiled C shares."""
+    if len(handshake_key) != 32:
+        raise ValueError("Handshake secret must be 32 bytes.")
+    mask_a = os.urandom(32)
+    mask_b = bytes(handshake_key[i] ^ mask_a[i] ^ ((i * 131 + 47) & 0xFF) for i in range(32))
+    return mask_a, mask_b
 
 
-def get_admin_cf_vault_path() -> Path:
-    """Return path to the Admin-ACL-protected Machine DPAPI Cloudflare credential blob."""
-    return get_admin_cf_dir() / "cf_admin.dpapi"
-
-
-def _apply_sddl_dacl(target: str | int, obj_type: int, sddl: str, by_handle: bool = False) -> None:
-    """Apply a protected Windows SDDL DACL (and BUILTIN\\Administrators owner when OS-elevated)."""
-    if os.name != "nt":
-        return
-
-    advapi32 = ctypes.windll.advapi32
-    kernel32 = ctypes.windll.kernel32
-    real_admin = False
-    try:
-        real_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        real_admin = False
-
-    full_sddl = f"O:BA{sddl}" if real_admin else sddl
-    p_sd = wintypes.LPVOID()
-    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(full_sddl, 1, ctypes.byref(p_sd), None):
-        raise OSError(f"ConvertStringSecurityDescriptorToSecurityDescriptorW failed: {ctypes.GetLastError()}")
-
-    try:
-        present = wintypes.BOOL()
-        defaulted = wintypes.BOOL()
-        p_dacl = wintypes.LPVOID()
-        if not advapi32.GetSecurityDescriptorDacl(p_sd, ctypes.byref(present), ctypes.byref(p_dacl), ctypes.byref(defaulted)):
-            raise OSError(f"GetSecurityDescriptorDacl failed: {ctypes.GetLastError()}")
-
-        p_owner = wintypes.LPVOID()
-        sec_info = _DACL_SECURITY_INFORMATION | _PROTECTED_DACL_SECURITY_INFORMATION
-        if real_admin and advapi32.GetSecurityDescriptorOwner(p_sd, ctypes.byref(p_owner), ctypes.byref(defaulted)) and p_owner.value:
-            sec_info |= _OWNER_SECURITY_INFORMATION
-        else:
-            p_owner = None
-
-        rc = (
-            advapi32.SetSecurityInfo(wintypes.HANDLE(target), obj_type, sec_info, p_owner, None, p_dacl, None)
-            if by_handle
-            else advapi32.SetNamedSecurityInfoW(str(target), obj_type, sec_info, p_owner, None, p_dacl, None)
-        )
-        if rc != 0:
-            raise PermissionError(f"Failed setting Windows Admin-only ACL (Win32 code {rc}).")
-    finally:
-        kernel32.LocalFree(p_sd)
-
-
-def lock_path_admin_only(path: Path, is_dir: bool = False) -> None:
-    """Restrict filesystem object permissions exclusively to NT AUTHORITY\\SYSTEM and BUILTIN\\Administrators."""
-    _apply_sddl_dacl(
-        str(path),
-        _SE_FILE_OBJECT,
-        _CF_ADMIN_DIR_SDDL if is_dir else _CF_ADMIN_FILE_SDDL,
-        by_handle=False,
-    )
-
-
-def save_admin_cf_credentials(
-    account_id: str = "",
-    api_token: str = "",
-    worker_url: str = "",
-    worker_token: str = "",
-    vault_path: Path | None = None,
-    entropy_bytes: bytes | None = None,
-) -> None:
-    """Encrypt and store Cloudflare credentials in a strict Windows Administrator/SYSTEM-only vault."""
-    if os.name == "nt" and not is_admin_process():
-        raise PermissionError("Administrator access on this desktop is required to configure Cloudflare credentials.")
-
-    w_url = (worker_url or "").strip().rstrip("/")
-    w_tok = (worker_token or "").strip()
-    acct = (account_id or "").strip()
-    tok = (api_token or "").strip()
-    if w_url and w_tok:
-        mode = "worker"
-    elif acct and tok:
-        mode = "direct"
-    else:
-        raise ValueError("Provide either Cloudflare Account ID + API Token or Worker URL + Relay Secret.")
-
-    reg_entropy = entropy_bytes
-    if reg_entropy is None:
-        reg_entropy = os.urandom(32)
-        if os.name == "nt":
-            import winreg
-
-            with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, _CF_ADMIN_HKLM_SUBKEY, 0, winreg.KEY_ALL_ACCESS) as key:
-                winreg.SetValueEx(key, "SealEntropy", 0, winreg.REG_BINARY, reg_entropy)
-                winreg.SetValueEx(key, "Mode", 0, winreg.REG_SZ, mode)
-                _apply_sddl_dacl(int(key.handle), _SE_REGISTRY_KEY, _CF_ADMIN_REG_SDDL, by_handle=True)
-
-    payload = json.dumps(
-        {
-            "mode": mode,
-            "account_id": acct if mode == "direct" else "",
-            "api_token": tok if mode == "direct" else "",
-            "worker_url": w_url if mode == "worker" else "",
-            "worker_token": w_tok if mode == "worker" else "",
-        },
-        separators=(",", ":"),
-    ).encode("utf-8")
-
-    dpapi_entropy = _CF_ADMIN_ENTROPY_PREFIX + (reg_entropy or b"")
-    cipher = dpapi_protect(payload, entropy=dpapi_entropy, local_machine=True)
-
-    target = vault_path or get_admin_cf_vault_path()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    lock_path_admin_only(target.parent, is_dir=True)
-    target.write_bytes(cipher)
-    lock_path_admin_only(target, is_dir=False)
-
-
-def _read_hklm_entropy() -> bytes:
-    if os.name != "nt":
+def reconstruct_handshake_key(part_a: bytes = SEAL_PART_A, part_b: bytes = SEAL_PART_B) -> bytes:
+    """Reconstruct the per-build handshake secret in memory from compiled C shares."""
+    if not part_a or not part_b or len(part_a) != 32 or len(part_b) != 32:
         return b""
-    import winreg
-
-    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _CF_ADMIN_HKLM_SUBKEY, 0, winreg.KEY_READ) as key:
-        val, _ = winreg.QueryValueEx(key, "SealEntropy")
-        return bytes(val) if val else b""
+    return bytes(part_a[i] ^ part_b[i] ^ ((i * 131 + 47) & 0xFF) for i in range(32))
 
 
-def is_admin_cf_store_present(vault_path: Path | None = None) -> bool:
-    """Detect whether an Admin-locked Cloudflare credential store exists (even if read is denied)."""
-    if os.name == "nt":
-        import winreg
-
-        try:
-            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _CF_ADMIN_HKLM_SUBKEY, 0, winreg.KEY_READ):
-                return True
-        except PermissionError:
-            return True
-        except FileNotFoundError:
-            pass
-
-    target = vault_path or get_admin_cf_vault_path()
-    for p in (target.parent, target):
-        try:
-            os.stat(p)
-            return True
-        except PermissionError:
-            return True
-        except FileNotFoundError:
-            continue
-        except OSError:
-            return True
-    return False
-
-
-def load_admin_cf_credentials(
-    vault_path: Path | None = None,
-    entropy_bytes: bytes | None = None,
-) -> CloudflareTransportConfig:
-    """Load Cloudflare transport config ONLY if Administrator privileges succeed against ACL & DPAPI."""
-    if os.name == "nt" and not is_admin_process():
-        if is_admin_cf_store_present(vault_path):
-            return CloudflareTransportConfig(mode="admin_locked")
-        return CloudflareTransportConfig(mode="none")
-
-    target = vault_path or get_admin_cf_vault_path()
-    try:
-        reg_entropy = entropy_bytes if entropy_bytes is not None else _read_hklm_entropy()
-        cipher = target.read_bytes()
-        dpapi_entropy = _CF_ADMIN_ENTROPY_PREFIX + (reg_entropy or b"")
-        plain = dpapi_unprotect(cipher, entropy=dpapi_entropy, local_machine=True)
-        data = json.loads(plain.decode("utf-8"))
-        if not isinstance(data, dict):
-            return CloudflareTransportConfig(mode="none")
-        mode = str(data.get("mode") or "")
-        if mode == "worker":
-            w_url = str(data.get("worker_url") or "").strip().rstrip("/")
-            w_tok = str(data.get("worker_token") or "").strip()
-            if w_url and w_tok:
-                return CloudflareTransportConfig(mode="worker", worker_url=w_url, worker_token=w_tok)
-        elif mode == "direct":
-            acct = str(data.get("account_id") or "").strip()
-            tok = str(data.get("api_token") or "").strip()
-            if acct and tok:
-                return CloudflareTransportConfig(mode="direct", account_id=acct, api_token=tok)
-    except PermissionError:
-        return CloudflareTransportConfig(mode="admin_locked")
-    except FileNotFoundError:
-        return CloudflareTransportConfig(mode="none")
-    except Exception:
-        return CloudflareTransportConfig(mode="none")
-    return CloudflareTransportConfig(mode="none")
-
-
-def _derive_stream(key: bytes, salt: bytes, slot_id: int, length: int) -> bytes:
-    """Deterministic multi-block SHA-256 keystream used at build time and mirrored in Rust."""
-    out = bytearray()
-    counter = 0
-    while len(out) < length:
-        block = hashlib.sha256(
-            key + salt + slot_id.to_bytes(1, "big") + counter.to_bytes(4, "big") + b"SG::NATIVE::SEAL"
-        ).digest()
-        out.extend(block)
-        counter += 1
-    return bytes(out[:length])
-
-
-def _encode_slot_bytes(raw_str: str, slot_id: int) -> dict[str, list[int]]:
+def _encode_slot_bytes(raw_str: str, slot_id: int) -> dict[str, Any]:
     raw_b = (raw_str or "").strip().encode("utf-8")
     if len(raw_b) + 2 > _FIXED_SLOT_LEN:
         raise ValueError(f"Secret slot {slot_id} exceeds {_FIXED_SLOT_LEN} bytes.")
@@ -297,9 +142,21 @@ def _encode_slot_bytes(raw_str: str, slot_id: int) -> dict[str, list[int]]:
 
     key = os.urandom(32)
     salt = os.urandom(32)
-    stream = _derive_stream(key, salt, slot_id, _FIXED_SLOT_LEN)
+    mul_c = (secrets.randbelow(120) * 2 + 1) & 0xFF
+    add_c = (secrets.randbelow(250) + 1) & 0xFF
+
+    out = bytearray()
+    counter = 0
+    while len(out) < _FIXED_SLOT_LEN:
+        block = hashlib.sha256(
+            key + salt + slot_id.to_bytes(1, "big") + counter.to_bytes(4, "big") + b"SG::WINHTTP::SEAL"
+        ).digest()
+        out.extend(block)
+        counter += 1
+    stream = bytes(out[:_FIXED_SLOT_LEN])
+
     masked = [
-        (plain[i] ^ stream[i] ^ ((i * 97 + slot_id * 17 + 31) & 0xFF))
+        (plain[i] ^ stream[i] ^ ((i * mul_c + slot_id * 29 + add_c) & 0xFF))
         for i in range(_FIXED_SLOT_LEN)
     ]
 
@@ -309,47 +166,79 @@ def _encode_slot_bytes(raw_str: str, slot_id: int) -> dict[str, list[int]]:
     for orig_idx, pos in enumerate(perm):
         shuffled[pos] = masked[orig_idx]
 
-    k_enc = [key[i] ^ ((i * 53 + slot_id * 11 + 19) & 0xFF) for i in range(32)]
-    s_enc = [salt[i] ^ ((i * 71 + slot_id * 7 + 11) & 0xFF) for i in range(32)]
-    return {"k": k_enc, "s": s_enc, "p": perm, "c": shuffled}
+    # Split cipher halves so raw memory scans find neither table alone
+    split_mask = [secrets.randbelow(256) for _ in range(_FIXED_SLOT_LEN)]
+    c_hi = [shuffled[i] ^ split_mask[i] for i in range(_FIXED_SLOT_LEN)]
+    k_enc = [key[i] ^ ((i * 59 + slot_id * 13 + 23) & 0xFF) for i in range(32)]
+    s_enc = [salt[i] ^ ((i * 73 + slot_id * 11 + 17) & 0xFF) for i in range(32)]
+
+    return {
+        "k": k_enc,
+        "s": s_enc,
+        "p": perm,
+        "c1": c_hi,
+        "c2": split_mask,
+        "mul": mul_c,
+        "add": add_c,
+    }
 
 
 def build_native_seal_rust_source(
     account_id: str = "",
     api_token: str = "",
+    handshake_key: bytes | None = None,
     worker_url: str = "",
-    worker_token: str = "",
-    admin_vault: bool = False,
+    relay_secret: str = "",
 ) -> str:
-    """Generate stripped native Rust cdylib source encoding sealed transport credentials.
+    """Generate stripped native Rust WinHTTP cdylib sealing either Worker Relay (mode 2) or Direct CF (mode 1).
 
-    Includes Windows anti-debugger detection and volatile memory wiping.
-    Supports:
-    - mode 1: Direct sealed Cloudflare credentials
-    - mode 2: Zero-Token Worker Relay
-    - mode 3: Windows Admin-Locked Vault (credentials prompted during desktop Setup)
+    In Worker Relay mode (recommended), CF_ACCOUNT_ID and CF_API_TOKEN are NEVER present in the
+    generated Rust code, compiled DLL, or desktop binary. All TLS calls run through WinHTTP with
+    HCCE_LOCAL_MACHINE chain validation (rejects CurrentUser\\Root MITM CAs), anti-debug checks,
+    caller PID-bound HMAC authentication, block-only guards, and volatile heap zeroing.
     """
-    use_worker = bool(worker_url.strip() and worker_token.strip())
-    use_direct = bool(account_id.strip() and api_token.strip())
-    if not use_worker and not use_direct and not admin_vault:
-        raise ValueError("Provide Worker credentials, Direct Cloudflare credentials, or admin_vault=True.")
+    w_url = (worker_url or "").strip().rstrip("/")
+    r_sec = (relay_secret or "").strip()
+    if w_url and r_sec:
+        parsed = urlparse(w_url)
+        if parsed.scheme.lower() != "https" or not parsed.hostname:
+            raise ValueError("WORKER_URL must be a valid https:// URL.")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("WORKER_URL must not include credentials, query strings, or fragments.")
+        port = parsed.port or 443
+        prefix = parsed.path.rstrip("/")
+        slot0_val = f"{parsed.hostname}:{port}{prefix}"
+        slot1_val = r_sec
+        seal_mode = 2
+    else:
+        acct = (account_id or "").strip()
+        tok = (api_token or "").strip()
+        if not acct or not tok:
+            raise ValueError("Provide WORKER_URL + RELAY_CLIENT_SECRET (or Cloudflare Account ID + API Token).")
+        slot0_val = acct
+        slot1_val = tok
+        seal_mode = 1
 
-    mode_num = 2 if use_worker else (1 if use_direct else 3)
+    hs_key = handshake_key if handshake_key and len(handshake_key) == 32 else os.urandom(32)
+    hs_mul = (secrets.randbelow(120) * 2 + 1) & 0xFF
+    hs_add = (secrets.randbelow(250) + 1) & 0xFF
+    hs_a = [secrets.randbelow(256) for _ in range(32)]
+    hs_b = [hs_key[i] ^ hs_a[i] ^ ((i * hs_mul + hs_add) & 0xFF) for i in range(32)]
+
     slots = [
-        _encode_slot_bytes(account_id if mode_num == 1 else "", 0),
-        _encode_slot_bytes(api_token if mode_num == 1 else "", 1),
-        _encode_slot_bytes(worker_url.rstrip("/") if mode_num == 2 else "", 2),
-        _encode_slot_bytes(worker_token if mode_num == 2 else "", 3),
+        _encode_slot_bytes(slot0_val, 0),
+        _encode_slot_bytes(slot1_val, 1),
     ]
 
-    def fmt_u8(arr: list[int]) -> str:
-        return "[" + ", ".join(str(x) for x in arr) + "]"
-
-    def fmt_usize(arr: list[int]) -> str:
+    def fmt_arr(arr: list[int]) -> str:
         return "[" + ", ".join(str(x) for x in arr) + "]"
 
     return f'''#![allow(non_snake_case)]
+#![allow(clippy::needless_range_loop)]
+
+use std::ffi::c_void;
 use std::ptr;
+use std::sync::atomic::{{AtomicBool, Ordering}};
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
@@ -357,7 +246,139 @@ extern "system" {{
     fn IsDebuggerPresent() -> i32;
     fn CheckRemoteDebuggerPresent(hProcess: isize, pbDebuggerPresent: *mut i32) -> i32;
     fn GetCurrentProcess() -> isize;
+    fn GetCurrentProcessId() -> u32;
+    fn GetCurrentThread() -> isize;
+    fn GetThreadContext(hThread: isize, lpContext: *mut c_void) -> i32;
 }}
+
+#[cfg(windows)]
+#[link(name = "winhttp")]
+extern "system" {{
+    fn WinHttpOpen(agent: *const u16, access: u32, proxy: *const u16, bypass: *const u16, flags: u32) -> *mut c_void;
+    fn WinHttpSetTimeouts(internet: *mut c_void, resolve: i32, connect: i32, send: i32, receive: i32) -> i32;
+    fn WinHttpConnect(session: *mut c_void, server: *const u16, port: u16, reserved: u32) -> *mut c_void;
+    fn WinHttpOpenRequest(
+        connect: *mut c_void,
+        verb: *const u16,
+        obj_name: *const u16,
+        version: *const u16,
+        referrer: *const u16,
+        accept_types: *const *const u16,
+        flags: u32,
+    ) -> *mut c_void;
+    fn WinHttpAddRequestHeaders(request: *mut c_void, headers: *const u16, len: u32, modifiers: u32) -> i32;
+    fn WinHttpSendRequest(
+        request: *mut c_void,
+        headers: *const u16,
+        headers_len: u32,
+        optional: *const u8,
+        optional_len: u32,
+        total_len: u32,
+        context: usize,
+    ) -> i32;
+    fn WinHttpReceiveResponse(request: *mut c_void, reserved: *mut c_void) -> i32;
+    fn WinHttpQueryHeaders(
+        request: *mut c_void,
+        info_level: u32,
+        name: *const u16,
+        buffer: *mut c_void,
+        buffer_len: *mut u32,
+        index: *mut u32,
+    ) -> i32;
+    fn WinHttpQueryOption(
+        internet: *mut c_void,
+        option: u32,
+        buffer: *mut c_void,
+        buffer_len: *mut u32,
+    ) -> i32;
+    fn WinHttpQueryDataAvailable(request: *mut c_void, available: *mut u32) -> i32;
+    fn WinHttpReadData(request: *mut c_void, buffer: *mut u8, to_read: u32, read: *mut u32) -> i32;
+    fn WinHttpCloseHandle(internet: *mut c_void) -> i32;
+}}
+
+#[cfg(windows)]
+#[link(name = "crypt32")]
+extern "system" {{
+    fn CertGetNameStringW(
+        cert_context: *const c_void,
+        dw_type: u32,
+        dw_flags: u32,
+        type_para: *const c_void,
+        name_string: *mut u16,
+        cch_name_string: u32,
+    ) -> u32;
+    fn CertFreeCertificateContext(cert_context: *const c_void) -> i32;
+    fn CertGetCertificateChain(
+        h_chain_engine: *mut c_void,
+        p_cert_context: *const c_void,
+        p_time: *const c_void,
+        h_additional_store: *mut c_void,
+        p_chain_para: *const CertChainPara,
+        dw_flags: u32,
+        pv_reserved: *mut c_void,
+        pp_chain_context: *mut *const CertChainContextHead,
+    ) -> i32;
+    fn CertFreeCertificateChain(p_chain_context: *const CertChainContextHead);
+}}
+
+#[repr(C)]
+struct CtlUsage {{
+    c_usage_identifier: u32,
+    rgpsz_usage_identifier: *const *const u8,
+}}
+
+#[repr(C)]
+struct CertUsageMatch {{
+    dw_type: u32,
+    usage: CtlUsage,
+}}
+
+#[repr(C)]
+struct CertChainPara {{
+    cb_size: u32,
+    requested_usage: CertUsageMatch,
+}}
+
+#[repr(C)]
+struct CertTrustStatus {{
+    dw_error_status: u32,
+    dw_info_status: u32,
+}}
+
+#[repr(C)]
+struct CertChainContextHead {{
+    cb_size: u32,
+    trust_status: CertTrustStatus,
+}}
+
+const HCCE_LOCAL_MACHINE: usize = 1;
+const SEAL_MODE: i32 = {seal_mode};
+const WINHTTP_ACCESS_TYPE_NO_PROXY: u32 = 1;
+const WINHTTP_FLAG_SECURE: u32 = 0x0080_0000;
+const WINHTTP_ADDREQ_FLAG_ADD: u32 = 0x2000_0000;
+const WINHTTP_ADDREQ_FLAG_REPLACE: u32 = 0x8000_0000;
+const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
+const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
+const WINHTTP_OPTION_SERVER_CERT_CONTEXT: u32 = 78;
+const CERT_NAME_SIMPLE_DISPLAY_TYPE: u32 = 4;
+const CERT_NAME_ISSUER_FLAG: u32 = 1;
+
+static TLS_TRUST_OK: AtomicBool = AtomicBool::new(false);
+
+fn volatile_zero(buf: &mut [u8]) {{
+    for b in buf.iter_mut() {{
+        unsafe {{ ptr::write_volatile(b, 0) }};
+    }}
+}}
+
+fn volatile_zero_u16(buf: &mut [u16]) {{
+    for w in buf.iter_mut() {{
+        unsafe {{ ptr::write_volatile(w, 0) }};
+    }}
+}}
+
+#[repr(C, align(16))]
+struct AlignedCtx([u8; 1232]);
 
 #[inline(always)]
 fn debugger_detected() -> bool {{
@@ -370,11 +391,26 @@ fn debugger_detected() -> bool {{
         if CheckRemoteDebuggerPresent(GetCurrentProcess(), &mut remote as *mut i32) != 0 && remote != 0 {{
             return true;
         }}
+        #[cfg(target_arch = "x86_64")]
+        {{
+            let mut ctx = AlignedCtx([0u8; 1232]);
+            // ContextFlags at offset 0x30 (48) = CONTEXT_AMD64 (0x100000) | CONTEXT_DEBUG_REGISTERS (0x10)
+            let flags: u32 = 0x0010_0010;
+            ptr::copy_nonoverlapping(&flags as *const u32 as *const u8, ctx.0.as_mut_ptr().add(48), 4);
+            if GetThreadContext(GetCurrentThread(), ctx.0.as_mut_ptr() as *mut c_void) != 0 {{
+                for off in [72usize, 80usize, 88usize, 96usize] {{
+                    let mut dr = 0u64;
+                    ptr::copy_nonoverlapping(ctx.0.as_ptr().add(off), &mut dr as *mut u64 as *mut u8, 8);
+                    if dr != 0 {{
+                        return true;
+                    }}
+                }}
+            }}
+        }}
     }}
     false
 }}
 
-// Compact SHA-256 implementation (no external crates required)
 const K256: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -386,152 +422,699 @@ const K256: [u32; 64] = [
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
-fn sha256_bytes(msg: &[u8]) -> [u8; 32] {{
+fn sha256_bytes(input: &[u8]) -> [u8; 32] {{
     let mut h: [u32; 8] = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
         0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
     ];
-    let bit_len = (msg.len() as u64) * 8;
-    let mut padded = msg.to_vec();
+    let bit_len = (input.len() as u64) * 8;
+    let mut padded = input.to_vec();
     padded.push(0x80);
     while (padded.len() % 64) != 56 {{
         padded.push(0);
     }}
     padded.extend_from_slice(&bit_len.to_be_bytes());
 
+    let mut w = [0u32; 64];
     for chunk in padded.chunks_exact(64) {{
-        let mut w = [0u32; 64];
         for i in 0..16 {{
-            w[i] = u32::from_be_bytes([chunk[i * 4], chunk[i * 4 + 1], chunk[i * 4 + 2], chunk[i * 4 + 3]]);
+            w[i] = u32::from_be_bytes([chunk[4*i], chunk[4*i+1], chunk[4*i+2], chunk[4*i+3]]);
         }}
         for i in 16..64 {{
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+            let s0 = w[i-15].rotate_right(7) ^ w[i-15].rotate_right(18) ^ (w[i-15] >> 3);
+            let s1 = w[i-2].rotate_right(17) ^ w[i-2].rotate_right(19) ^ (w[i-2] >> 10);
+            w[i] = w[i-16].wrapping_add(s0).wrapping_add(w[i-7]).wrapping_add(s1);
         }}
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+            (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
         for i in 0..64 {{
-            let S1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
             let ch = (e & f) ^ ((!e) & g);
-            let temp1 = hh.wrapping_add(S1).wrapping_add(ch).wrapping_add(K256[i]).wrapping_add(w[i]);
-            let S0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let temp1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K256[i]).wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
             let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = S0.wrapping_add(maj);
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
+            let temp2 = s0.wrapping_add(maj);
+            hh = g; g = f; f = e; e = d.wrapping_add(temp1);
+            d = c; c = b; b = a; a = temp1.wrapping_add(temp2);
         }}
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(hh);
+        h[0] = h[0].wrapping_add(a); h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c); h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e); h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g); h[7] = h[7].wrapping_add(hh);
     }}
+    volatile_zero(&mut padded);
     let mut out = [0u8; 32];
     for i in 0..8 {{
-        out[i * 4..i * 4 + 4].copy_from_slice(&h[i].to_be_bytes());
+        out[4*i..4*i+4].copy_from_slice(&h[i].to_be_bytes());
     }}
     out
 }}
 
-struct SlotData {{
+fn hmac_sha256(key: &[u8; 32], msg: &[u8]) -> [u8; 32] {{
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..32 {{
+        ipad[i] ^= key[i];
+        opad[i] ^= key[i];
+    }}
+    let mut inner = Vec::with_capacity(64 + msg.len());
+    inner.extend_from_slice(&ipad);
+    inner.extend_from_slice(msg);
+    let inner_hash = sha256_bytes(&inner);
+    volatile_zero(&mut inner);
+
+    let mut outer = [0u8; 96];
+    outer[..64].copy_from_slice(&opad);
+    outer[64..].copy_from_slice(&inner_hash);
+    let res = sha256_bytes(&outer);
+    volatile_zero(&mut ipad);
+    volatile_zero(&mut opad);
+    volatile_zero(&mut outer);
+    res
+}}
+
+struct SealedSlot {{
     k: [u8; 32],
     s: [u8; 32],
     p: [usize; 256],
-    c: [u8; 256],
+    c1: [u8; 256],
+    c2: [u8; 256],
+    mul: u8,
+    add: u8,
 }}
 
-static SLOTS: [SlotData; 4] = [
-    SlotData {{ k: {fmt_u8(slots[0]["k"])}, s: {fmt_u8(slots[0]["s"])}, p: {fmt_usize(slots[0]["p"])}, c: {fmt_u8(slots[0]["c"])} }},
-    SlotData {{ k: {fmt_u8(slots[1]["k"])}, s: {fmt_u8(slots[1]["s"])}, p: {fmt_usize(slots[1]["p"])}, c: {fmt_u8(slots[1]["c"])} }},
-    SlotData {{ k: {fmt_u8(slots[2]["k"])}, s: {fmt_u8(slots[2]["s"])}, p: {fmt_usize(slots[2]["p"])}, c: {fmt_u8(slots[2]["c"])} }},
-    SlotData {{ k: {fmt_u8(slots[3]["k"])}, s: {fmt_u8(slots[3]["s"])}, p: {fmt_usize(slots[3]["p"])}, c: {fmt_u8(slots[3]["c"])} }},
+const HS_MUL: u8 = {hs_mul};
+const HS_ADD: u8 = {hs_add};
+const HS_A: [u8; 32] = {fmt_arr(hs_a)};
+const HS_B: [u8; 32] = {fmt_arr(hs_b)};
+
+#[used]
+static DECOY_TABLE: [u8; 64] = {fmt_arr([secrets.randbelow(256) for _ in range(64)])};
+
+static SLOTS: [SealedSlot; 2] = [
+    SealedSlot {{
+        k: {fmt_arr(slots[0]["k"])}, s: {fmt_arr(slots[0]["s"])}, p: {fmt_arr(slots[0]["p"])},
+        c1: {fmt_arr(slots[0]["c1"])}, c2: {fmt_arr(slots[0]["c2"])}, mul: {slots[0]["mul"]}, add: {slots[0]["add"]},
+    }},
+    SealedSlot {{
+        k: {fmt_arr(slots[1]["k"])}, s: {fmt_arr(slots[1]["s"])}, p: {fmt_arr(slots[1]["p"])},
+        c1: {fmt_arr(slots[1]["c1"])}, c2: {fmt_arr(slots[1]["c2"])}, mul: {slots[1]["mul"]}, add: {slots[1]["add"]},
+    }},
 ];
 
-#[inline(never)]
-fn volatile_zero(buf: &mut [u8]) {{
-    for b in buf.iter_mut() {{
-        unsafe {{ ptr::write_volatile(b as *mut u8, 0); }}
-    }}
-}}
-
-#[no_mangle]
-pub extern "C" fn sg_seal_mode() -> i32 {{
-    if debugger_detected() {{
-        return 0;
-    }}
-    {mode_num}
-}}
-
-#[no_mangle]
-pub extern "C" fn sg_wipe_buffer(buf: *mut u8, len: usize) {{
-    if buf.is_null() || len == 0 {{
-        return;
-    }}
-    unsafe {{
-        for i in 0..len {{
-            ptr::write_volatile(buf.add(i), 0);
-        }}
-    }}
-}}
-
-#[no_mangle]
-pub extern "C" fn sg_unseal_slot(slot_id: i32, out_buf: *mut u8, max_len: usize) -> i32 {{
-    if debugger_detected() || out_buf.is_null() || slot_id < 0 || slot_id > 3 {{
-        return -1;
-    }}
-    let sid = slot_id as usize;
+fn unseal_vec(sid: usize) -> Option<Vec<u8>> {{
     let slot = &SLOTS[sid];
-
     let mut key = [0u8; 32];
     let mut salt = [0u8; 32];
     for i in 0..32 {{
-        key[i] = slot.k[i] ^ (((i * 53 + sid * 11 + 19) & 0xFF) as u8);
-        salt[i] = slot.s[i] ^ (((i * 71 + sid * 7 + 11) & 0xFF) as u8);
+        key[i] = slot.k[i] ^ (((i * 59 + sid * 13 + 23) & 0xFF) as u8);
+        salt[i] = slot.s[i] ^ (((i * 73 + sid * 11 + 17) & 0xFF) as u8);
     }}
-
     let mut stream = [0u8; 256];
     for ctr in 0u32..8u32 {{
-        let mut msg = Vec::with_capacity(85);
+        let mut msg = Vec::with_capacity(86);
         msg.extend_from_slice(&key);
         msg.extend_from_slice(&salt);
         msg.push(sid as u8);
         msg.extend_from_slice(&ctr.to_be_bytes());
-        msg.extend_from_slice(b"SG::NATIVE::SEAL");
+        msg.extend_from_slice(b"SG::WINHTTP::SEAL");
         let digest = sha256_bytes(&msg);
-        stream[(ctr as usize) * 32..(ctr as usize + 1) * 32].copy_from_slice(&digest);
+        stream[(ctr as usize)*32..(ctr as usize + 1)*32].copy_from_slice(&digest);
         volatile_zero(&mut msg);
     }}
-
     let mut plain = [0u8; 256];
     for i in 0..256 {{
-        let masked = slot.c[slot.p[i]];
-        plain[i] = masked ^ stream[i] ^ (((i * 97 + sid * 17 + 31) & 0xFF) as u8);
+        let pos = slot.p[i];
+        let sh = slot.c1[pos] ^ slot.c2[pos];
+        plain[i] = sh ^ stream[i] ^ (((i * (slot.mul as usize) + sid * 29 + (slot.add as usize)) & 0xFF) as u8);
     }}
-
     let len = ((plain[0] as usize) << 8) | (plain[1] as usize);
-    let rc = if len + 2 > 256 || len > max_len {{
-        -2
+    let out = if len + 2 <= 256 {{
+        Some(plain[2..2+len].to_vec())
     }} else {{
-        unsafe {{
-            ptr::copy_nonoverlapping(plain.as_ptr().add(2), out_buf, len);
-        }}
-        len as i32
+        None
     }};
-
     volatile_zero(&mut key);
     volatile_zero(&mut salt);
     volatile_zero(&mut stream);
     volatile_zero(&mut plain);
-    rc
+    out
+}}
+
+fn verify_caller_hmac(msg: &[u8], sig_hex: &[u8]) -> bool {{
+    if sig_hex.len() != 64 {{
+        return false;
+    }}
+    let mut hs_key = [0u8; 32];
+    for i in 0..32 {{
+        hs_key[i] = HS_A[i] ^ HS_B[i] ^ (((i * (HS_MUL as usize) + (HS_ADD as usize)) & 0xFF) as u8);
+    }}
+    let mac = hmac_sha256(&hs_key, msg);
+    volatile_zero(&mut hs_key);
+    let hex_chars = b"0123456789abcdef";
+    let mut diff = 0u8;
+    for i in 0..32 {{
+        let hi = hex_chars[(mac[i] >> 4) as usize];
+        let lo = hex_chars[(mac[i] & 0x0f) as usize];
+        diff |= hi ^ sig_hex[2 * i].to_ascii_lowercase();
+        diff |= lo ^ sig_hex[2 * i + 1].to_ascii_lowercase();
+    }}
+    diff == 0
+}}
+
+fn to_wide_vec(s: &str) -> Vec<u16> {{
+    let mut v: Vec<u16> = s.encode_utf16().collect();
+    v.push(0);
+    v
+}}
+
+fn is_valid_uuid(s: &str) -> bool {{
+    let b = s.as_bytes();
+    if b.len() != 36 {{
+        return false;
+    }}
+    for (i, ch) in b.iter().enumerate() {{
+        if i == 8 || i == 13 || i == 18 || i == 23 {{
+            if *ch != b'-' {{ return false; }}
+        }} else if !ch.is_ascii_hexdigit() {{
+            return false;
+        }}
+    }}
+    true
+}}
+
+// Extract top-level / simple JSON key values cleanly without matching text inside unrelated string values
+fn json_extract_kv_tokens(json: &str) -> Vec<(String, String)> {{
+    let mut pairs = Vec::new();
+    let bytes = json.as_bytes();
+    let mut i = 0usize;
+    let n = bytes.len();
+    let read_str = |idx: &mut usize| -> Option<String> {{
+        if *idx >= n || bytes[*idx] != b'"' {{ return None; }}
+        *idx += 1;
+        let mut s = String::new();
+        while *idx < n {{
+            let ch = bytes[*idx];
+            if ch == b'\\\\' && *idx + 1 < n {{
+                s.push(bytes[*idx + 1] as char);
+                *idx += 2;
+                continue;
+            }}
+            if ch == b'"' {{
+                *idx += 1;
+                return Some(s);
+            }}
+            s.push(ch as char);
+            *idx += 1;
+        }}
+        None
+    }};
+    while i < n {{
+        if bytes[i] == b'"' {{
+            if let Some(key) = read_str(&mut i) {{
+                while i < n && bytes[i].is_ascii_whitespace() {{ i += 1; }}
+                if i < n && bytes[i] == b':' {{
+                    i += 1;
+                    while i < n && bytes[i].is_ascii_whitespace() {{ i += 1; }}
+                    if i < n && bytes[i] == b'"' {{
+                        if let Some(val) = read_str(&mut i) {{
+                            pairs.push((key, val));
+                            continue;
+                        }}
+                    }} else if i < n && (bytes[i] == b'[' || bytes[i] == b'{{') {{
+                        pairs.push((key, String::from(bytes[i] as char)));
+                        i += 1;
+                        continue;
+                    }} else if i < n {{
+                        let start = i;
+                        while i < n && !matches!(bytes[i], b',' | b'}}' | b']') && !bytes[i].is_ascii_whitespace() {{
+                            i += 1;
+                        }}
+                        pairs.push((key, String::from_utf8_lossy(&bytes[start..i]).to_string()));
+                        continue;
+                    }}
+                }}
+            }}
+        }}
+        i += 1;
+    }}
+    pairs
+}}
+
+fn validate_path(path: &str) -> bool {{
+    if path.is_empty() || path.len() > 512 || path.contains("..") || path.contains('@') || path.contains('#') {{
+        return false;
+    }}
+    if path.bytes().any(|b| b <= 0x20) {{
+        return false;
+    }}
+    let base_ok = (SEAL_MODE == 2 && (path == "/health" || path == "/v1/health"))
+        || path == "/lists"
+        || path.starts_with("/lists?")
+        || path.starts_with("/lists/")
+        || path == "/rules"
+        || path.starts_with("/rules?")
+        || path.starts_with("/rules/");
+    base_ok
+}}
+
+fn validate_body_policy(method: &str, path: &str, body: &str) -> bool {{
+    let path_base = path.split('?').next().unwrap_or("");
+    let kvs = json_extract_kv_tokens(body);
+    if (method == "POST" || method == "PUT") && (path_base == "/rules" || path_base.starts_with("/rules/")) {{
+        let has_block = kvs.iter().any(|(k, v)| k == "action" && v.eq_ignore_ascii_case("block"));
+        let has_bad_action = kvs.iter().any(|(k, v)| k == "action" && !v.eq_ignore_ascii_case("block"));
+        let has_disabled = kvs.iter().any(|(k, v)| k == "enabled" && !v.eq_ignore_ascii_case("true"));
+        let has_enabled = kvs.iter().any(|(k, v)| k == "enabled" && v.eq_ignore_ascii_case("true"));
+        return has_block && !has_bad_action && has_enabled && !has_disabled;
+    }}
+    if method == "POST" && path_base == "/lists" {{
+        return kvs.iter().any(|(k, v)| k == "type" && v.eq_ignore_ascii_case("HOSTNAME"));
+    }}
+    if method == "PATCH" && path_base.starts_with("/lists/") {{
+        let has_append = kvs.iter().any(|(k, _)| k == "append");
+        let has_forbidden = kvs.iter().any(|(k, _)| k == "remove" || k == "items");
+        return has_append && !has_forbidden;
+    }}
+    method == "GET" || method == "DELETE"
+}}
+
+fn is_trailing_chunk_name(name: &str) -> Option<&'static str> {{
+    for (prefix, base) in [
+        ("automated_http_search_block_p", "automated_http_search_block"),
+        ("automated_block_p", "automated_block"),
+    ] {{
+        if let Some(num_str) = name.strip_prefix(prefix) {{
+            if let Ok(n) = num_str.parse::<u32>() {{
+                if n >= 2 {{
+                    return Some(base);
+                }}
+            }}
+        }}
+    }}
+    None
+}}
+
+#[cfg(windows)]
+fn verify_no_mitm_cert(h_conn: *mut c_void) -> bool {{
+    if TLS_TRUST_OK.load(Ordering::Acquire) {{
+        return true;
+    }}
+    unsafe {{
+        let m_head = to_wide_vec("HEAD");
+        let p_root = to_wide_vec("/");
+        let h_req = WinHttpOpenRequest(h_conn, m_head.as_ptr(), p_root.as_ptr(), ptr::null(), ptr::null(), ptr::null(), WINHTTP_FLAG_SECURE);
+        if h_req.is_null() {{
+            return false;
+        }}
+        let ok_send = WinHttpSendRequest(h_req, ptr::null(), 0, ptr::null(), 0, 0, 0);
+        let mut trusted = false;
+        if ok_send != 0 && WinHttpReceiveResponse(h_req, ptr::null_mut()) != 0 {{
+            let mut cert_ctx: *const c_void = ptr::null();
+            let mut sz = std::mem::size_of::<*const c_void>() as u32;
+            if WinHttpQueryOption(h_req, WINHTTP_OPTION_SERVER_CERT_CONTEXT, &mut cert_ctx as *mut *const c_void as *mut c_void, &mut sz) != 0 && !cert_ctx.is_null() {{
+                let mut issuer_buf = [0u16; 256];
+                let mut subj_buf = [0u16; 256];
+                let n1 = CertGetNameStringW(cert_ctx, CERT_NAME_SIMPLE_DISPLAY_TYPE, CERT_NAME_ISSUER_FLAG, ptr::null(), issuer_buf.as_mut_ptr(), 256);
+                let n2 = CertGetNameStringW(cert_ctx, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, ptr::null(), subj_buf.as_mut_ptr(), 256);
+                let issuer = if n1 > 1 {{ String::from_utf16_lossy(&issuer_buf[..(n1 as usize - 1)]).to_lowercase() }} else {{ String::new() }};
+                let subj = if n2 > 1 {{ String::from_utf16_lossy(&subj_buf[..(n2 as usize - 1)]).to_lowercase() }} else {{ String::new() }};
+                let combined = format!("{{}}|{{}}", issuer, subj);
+                let bad = ["fiddler", "do_not_trust", "mitmproxy", "portswigger", "burp", "charles", "proxyman", "httptoolkit"];
+                let not_blacklisted = !bad.iter().any(|k| combined.contains(k));
+
+                // Validate certificate chain using HCCE_LOCAL_MACHINE (ignores user-added CurrentUser\\Root CAs)
+                let para = CertChainPara {{
+                    cb_size: std::mem::size_of::<CertChainPara>() as u32,
+                    requested_usage: CertUsageMatch {{
+                        dw_type: 0,
+                        usage: CtlUsage {{
+                            c_usage_identifier: 0,
+                            rgpsz_usage_identifier: ptr::null(),
+                        }},
+                    }},
+                }};
+                let mut chain_ctx: *const CertChainContextHead = ptr::null();
+                let mut lm_chain_ok = false;
+                if CertGetCertificateChain(
+                    HCCE_LOCAL_MACHINE as *mut c_void,
+                    cert_ctx,
+                    ptr::null(),
+                    ptr::null_mut(),
+                    &para,
+                    0,
+                    ptr::null_mut(),
+                    &mut chain_ctx,
+                ) != 0 && !chain_ctx.is_null() {{
+                    lm_chain_ok = (*chain_ctx).trust_status.dw_error_status == 0;
+                    CertFreeCertificateChain(chain_ctx);
+                }}
+
+                CertFreeCertificateContext(cert_ctx);
+                trusted = not_blacklisted && lm_chain_ok;
+            }}
+        }}
+        WinHttpCloseHandle(h_req);
+        if trusted {{
+            TLS_TRUST_OK.store(true, Ordering::Release);
+        }}
+        trusted
+    }}
+}}
+
+#[cfg(windows)]
+fn exec_http_raw(method: &str, rel_path: &str, body_bytes: &[u8]) -> Result<(i32, Vec<u8>), i32> {{
+    let mut s0 = unseal_vec(0).ok_or(-5)?;
+    let mut s1 = unseal_vec(1).ok_or(-5)?;
+
+    let (mut host_owned, port, mut full_path, mut auth_hdr) = if SEAL_MODE == 2 {{
+        let endpoint = String::from_utf8_lossy(&s0).into_owned();
+        let secret = String::from_utf8_lossy(&s1).into_owned();
+        let (h_owned, p_num, prefix_owned) = {{
+            let (host_port, base_prefix) = match endpoint.find('/') {{
+                Some(idx) => (&endpoint[..idx], endpoint[idx..].trim_end_matches('/')),
+                None => (endpoint.as_str(), ""),
+            }};
+            let (h_str, p_u16) = if let Some((h, p_str)) = host_port.rsplit_once(':') {{
+                (h.to_string(), p_str.parse::<u16>().unwrap_or(443))
+            }} else {{
+                (host_port.to_string(), 443u16)
+            }};
+            (h_str, p_u16, base_prefix.to_string())
+        }};
+        let v1_rel = if rel_path.starts_with("/v1/") || rel_path == "/v1" {{
+            rel_path.to_string()
+        }} else {{
+            format!("/v1{{}}", rel_path)
+        }};
+        let fpath = format!("{{}}{{}}", prefix_owned, v1_rel);
+        let ahdr = format!("X-SG-Relay-Key: {{}}\\r\\nContent-Type: application/json\\r\\nConnection: close\\r\\n", secret);
+        volatile_zero(&mut endpoint.into_bytes());
+        volatile_zero(&mut secret.into_bytes());
+        volatile_zero(&mut prefix_owned.into_bytes());
+        (h_owned, p_num, fpath, ahdr)
+    }} else {{
+        let acct = String::from_utf8_lossy(&s0).into_owned();
+        let tok = String::from_utf8_lossy(&s1).into_owned();
+        let fpath = format!("/client/v4/accounts/{{}}/gateway{{}}", acct, rel_path);
+        let ahdr = format!("Authorization: Bearer {{}}\\r\\nContent-Type: application/json\\r\\nConnection: close\\r\\n", tok);
+        volatile_zero(&mut acct.into_bytes());
+        volatile_zero(&mut tok.into_bytes());
+        ("api.cloudflare.com".to_string(), 443u16, fpath, ahdr)
+    }};
+
+    volatile_zero(&mut s0);
+    volatile_zero(&mut s1);
+
+    unsafe {{
+        let agent_w = to_wide_vec("SentinelGateAI/2.0");
+        let h_sess = WinHttpOpen(agent_w.as_ptr(), WINHTTP_ACCESS_TYPE_NO_PROXY, ptr::null(), ptr::null(), 0);
+        if h_sess.is_null() {{
+            volatile_zero(&mut host_owned.into_bytes());
+            volatile_zero(&mut full_path.into_bytes());
+            volatile_zero(&mut auth_hdr.into_bytes());
+            return Err(-5);
+        }}
+        WinHttpSetTimeouts(h_sess, 10000, 10000, 15000, 25000);
+        let mut host_w = to_wide_vec(&host_owned);
+        volatile_zero(&mut host_owned.into_bytes());
+        let h_conn = WinHttpConnect(h_sess, host_w.as_ptr(), port, 0);
+        volatile_zero_u16(&mut host_w);
+        if h_conn.is_null() {{
+            WinHttpCloseHandle(h_sess);
+            volatile_zero(&mut full_path.into_bytes());
+            volatile_zero(&mut auth_hdr.into_bytes());
+            return Err(-5);
+        }}
+
+        if !verify_no_mitm_cert(h_conn) {{
+            WinHttpCloseHandle(h_conn);
+            WinHttpCloseHandle(h_sess);
+            volatile_zero(&mut full_path.into_bytes());
+            volatile_zero(&mut auth_hdr.into_bytes());
+            return Err(-5);
+        }}
+
+        let m_w = to_wide_vec(method);
+        let mut p_w = to_wide_vec(&full_path);
+        volatile_zero(&mut full_path.into_bytes());
+        let h_req = WinHttpOpenRequest(h_conn, m_w.as_ptr(), p_w.as_ptr(), ptr::null(), ptr::null(), ptr::null(), WINHTTP_FLAG_SECURE);
+        volatile_zero_u16(&mut p_w);
+        if h_req.is_null() {{
+            WinHttpCloseHandle(h_conn);
+            WinHttpCloseHandle(h_sess);
+            volatile_zero(&mut auth_hdr.into_bytes());
+            return Err(-5);
+        }}
+
+        let mut hdr_w = to_wide_vec(&auth_hdr);
+        volatile_zero(&mut auth_hdr.into_bytes());
+        WinHttpAddRequestHeaders(h_req, hdr_w.as_ptr(), (hdr_w.len() - 1) as u32, WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+        volatile_zero_u16(&mut hdr_w);
+
+        let opt_ptr = if body_bytes.is_empty() {{ ptr::null() }} else {{ body_bytes.as_ptr() }};
+        let opt_len = body_bytes.len() as u32;
+        let sent = WinHttpSendRequest(h_req, ptr::null(), 0, opt_ptr, opt_len, opt_len, 0);
+        let ok_recv = if sent != 0 {{ WinHttpReceiveResponse(h_req, ptr::null_mut()) }} else {{ 0 }};
+        if ok_recv == 0 {{
+            WinHttpCloseHandle(h_req);
+            WinHttpCloseHandle(h_conn);
+            WinHttpCloseHandle(h_sess);
+            return Err(-5);
+        }}
+
+        let mut status_code: u32 = 0;
+        let mut status_len: u32 = 4;
+        WinHttpQueryHeaders(
+            h_req,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            ptr::null(),
+            &mut status_code as *mut u32 as *mut c_void,
+            &mut status_len,
+            ptr::null_mut(),
+        );
+
+        let mut resp = Vec::new();
+        loop {{
+            let mut avail: u32 = 0;
+            if WinHttpQueryDataAvailable(h_req, &mut avail) == 0 || avail == 0 {{
+                break;
+            }}
+            let mut tmp = vec![0u8; avail as usize];
+            let mut read_cnt: u32 = 0;
+            if WinHttpReadData(h_req, tmp.as_mut_ptr(), avail, &mut read_cnt) == 0 || read_cnt == 0 {{
+                break;
+            }}
+            resp.extend_from_slice(&tmp[..read_cnt as usize]);
+        }}
+
+        WinHttpCloseHandle(h_req);
+        WinHttpCloseHandle(h_conn);
+        WinHttpCloseHandle(h_sess);
+        Ok((status_code as i32, resp))
+    }}
+}}
+
+fn check_delete_rule_safe(rel_path: &str) -> bool {{
+    let uuid = match rel_path.strip_prefix("/rules/") {{
+        Some(u) => u.split('?').next().unwrap_or(""),
+        None => return false,
+    }};
+    if !is_valid_uuid(uuid) {{
+        return false;
+    }}
+    #[cfg(windows)]
+    {{
+        let (status, raw) = match exec_http_raw("GET", "/rules?per_page=100", b"") {{
+            Ok(v) => v,
+            Err(_) => return false,
+        }};
+        if status != 200 {{
+            return false;
+        }}
+        let text = String::from_utf8_lossy(&raw);
+        let kvs = json_extract_kv_tokens(&text);
+        // Walk groups per object cleanly by matching id -> name -> action -> enabled
+        let mut target_base: Option<&'static str> = None;
+        let mut rules: Vec<(String, String, String, String)> = Vec::new();
+        let (mut cur_id, mut cur_name, mut cur_act, mut cur_en) = (String::new(), String::new(), String::new(), String::new());
+        for (k, v) in kvs {{
+            if k == "id" && is_valid_uuid(&v) {{
+                if !cur_id.is_empty() {{
+                    rules.push((cur_id.clone(), cur_name.clone(), cur_act.clone(), cur_en.clone()));
+                }}
+                cur_id = v;
+                cur_name.clear();
+                cur_act.clear();
+                cur_en.clear();
+            }} else if k == "name" && cur_name.is_empty() {{
+                cur_name = v;
+            }} else if k == "action" && cur_act.is_empty() {{
+                cur_act = v;
+            }} else if k == "enabled" && cur_en.is_empty() {{
+                cur_en = v;
+            }}
+        }}
+        if !cur_id.is_empty() {{
+            rules.push((cur_id, cur_name, cur_act, cur_en));
+        }}
+        for (rid, rname, _, _) in &rules {{
+            if rid == uuid {{
+                target_base = is_trailing_chunk_name(rname);
+                break;
+            }}
+        }}
+        let primary_base = match target_base {{
+            Some(b) => b,
+            None => return false,
+        }};
+        let p1 = format!("{{}}_p1", primary_base);
+        return rules.iter().any(|(rid, rname, ract, ren)| {{
+            rid != uuid
+                && ren.eq_ignore_ascii_case("true")
+                && ract.eq_ignore_ascii_case("block")
+                && (rname == primary_base || rname == &p1)
+        }});
+    }}
+    #[cfg(not(windows))]
+    false
+}}
+
+#[no_mangle]
+pub extern "C" fn sg_cf_mode(
+    nonce_ptr: *const u8,
+    nonce_len: usize,
+    sig_ptr: *const u8,
+    sig_len: usize,
+) -> i32 {{
+    if debugger_detected() {{
+        return -1;
+    }}
+    if nonce_ptr.is_null() || sig_ptr.is_null() || nonce_len == 0 || nonce_len > 128 {{
+        return -2;
+    }}
+    let (nonce, sig) = unsafe {{
+        (
+            std::slice::from_raw_parts(nonce_ptr, nonce_len),
+            std::slice::from_raw_parts(sig_ptr, sig_len),
+        )
+    }};
+    #[cfg(windows)]
+    let pid = unsafe {{ GetCurrentProcessId() }};
+    #[cfg(not(windows))]
+    let pid = 0u32;
+
+    let mut msg = Vec::with_capacity(32 + nonce.len());
+    msg.extend_from_slice(b"SG::MODE::");
+    msg.extend_from_slice(pid.to_string().as_bytes());
+    msg.extend_from_slice(b"::");
+    msg.extend_from_slice(nonce);
+    let ok = verify_caller_hmac(&msg, sig);
+    volatile_zero(&mut msg);
+    if !ok {{
+        return -4;
+    }}
+    SEAL_MODE
+}}
+
+#[no_mangle]
+pub extern "C" fn sg_cf_request(
+    nonce_ptr: *const u8,
+    nonce_len: usize,
+    sig_ptr: *const u8,
+    sig_len: usize,
+    method_ptr: *const u8,
+    method_len: usize,
+    path_ptr: *const u8,
+    path_len: usize,
+    body_ptr: *const u8,
+    body_len: usize,
+    out_status: *mut i32,
+    out_buf: *mut u8,
+    out_buf_cap: usize,
+    out_len: *mut usize,
+) -> i32 {{
+    if debugger_detected() {{
+        return -1;
+    }}
+    if nonce_ptr.is_null() || sig_ptr.is_null() || method_ptr.is_null() || path_ptr.is_null() || out_status.is_null() || out_len.is_null() {{
+        return -2;
+    }}
+    if nonce_len == 0 || nonce_len > 128 || method_len == 0 || method_len > 16 || path_len == 0 || path_len > 512 {{
+        return -2;
+    }}
+    let (nonce, sig, method_b, path_b) = unsafe {{
+        (
+            std::slice::from_raw_parts(nonce_ptr, nonce_len),
+            std::slice::from_raw_parts(sig_ptr, sig_len),
+            std::slice::from_raw_parts(method_ptr, method_len),
+            std::slice::from_raw_parts(path_ptr, path_len),
+        )
+    }};
+    let body_b = if body_ptr.is_null() || body_len == 0 {{
+        &[][..]
+    }} else {{
+        unsafe {{ std::slice::from_raw_parts(body_ptr, body_len) }}
+    }};
+
+    #[cfg(windows)]
+    let pid = unsafe {{ GetCurrentProcessId() }};
+    #[cfg(not(windows))]
+    let pid = 0u32;
+
+    let mut msg = Vec::with_capacity(40 + nonce.len() + method_b.len() + path_b.len());
+    msg.extend_from_slice(b"SG::REQ::");
+    msg.extend_from_slice(pid.to_string().as_bytes());
+    msg.extend_from_slice(b"::");
+    msg.extend_from_slice(nonce);
+    msg.extend_from_slice(b"::");
+    msg.extend_from_slice(method_b);
+    msg.extend_from_slice(b"::");
+    msg.extend_from_slice(path_b);
+    let auth_ok = verify_caller_hmac(&msg, sig);
+    volatile_zero(&mut msg);
+    if !auth_ok {{
+        return -4;
+    }}
+
+    let method = match std::str::from_utf8(method_b) {{
+        Ok(m) if matches!(m, "GET" | "POST" | "PUT" | "PATCH" | "DELETE") => m,
+        _ => return -3,
+    }};
+    let rel_path = match std::str::from_utf8(path_b) {{
+        Ok(p) if validate_path(p) => p,
+        _ => return -3,
+    }};
+    let body_str = match std::str::from_utf8(body_b) {{
+        Ok(s) => s,
+        Err(_) => return -3,
+    }};
+    if !validate_body_policy(method, rel_path, body_str) {{
+        return -3;
+    }}
+    if method == "DELETE" && !check_delete_rule_safe(rel_path) {{
+        return -3;
+    }}
+
+    #[cfg(windows)]
+    {{
+        match exec_http_raw(method, rel_path, body_b) {{
+            Ok((st, resp)) => unsafe {{
+                *out_status = st;
+                *out_len = resp.len();
+                if resp.len() > out_buf_cap {{
+                    return -6;
+                }}
+                if !out_buf.is_null() && !resp.is_empty() {{
+                    ptr::copy_nonoverlapping(resp.as_ptr(), out_buf, resp.len());
+                }}
+                0
+            }},
+            Err(rc) => rc,
+        }}
+    }}
+    #[cfg(not(windows))]
+    -5
 }}
 '''
 
@@ -548,71 +1131,114 @@ def _load_native_seal_dll() -> ctypes.CDLL | None:
     if actual != EXPECTED_SEAL_DLL_SHA256.upper():
         return None
     lib = ctypes.CDLL(str(dll_path))
-    lib.sg_seal_mode.restype = ctypes.c_int
-    lib.sg_unseal_slot.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t]
-    lib.sg_unseal_slot.restype = ctypes.c_int
-    lib.sg_wipe_buffer.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
-    lib.sg_wipe_buffer.restype = None
+    lib.sg_cf_mode.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t]
+    lib.sg_cf_mode.restype = ctypes.c_int
+    lib.sg_cf_request.argtypes = [
+        ctypes.c_char_p, ctypes.c_size_t,
+        ctypes.c_char_p, ctypes.c_size_t,
+        ctypes.c_char_p, ctypes.c_size_t,
+        ctypes.c_char_p, ctypes.c_size_t,
+        ctypes.c_char_p, ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_char_p, ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    lib.sg_cf_request.restype = ctypes.c_int
     return lib
 
 
-def _read_native_slot(lib: ctypes.CDLL, slot_id: int) -> str:
-    buf = ctypes.create_string_buffer(_FIXED_SLOT_LEN)
-    try:
-        n = lib.sg_unseal_slot(slot_id, buf, _FIXED_SLOT_LEN)
-        if n <= 0:
-            return ""
-        return bytes(buf.raw[:n]).decode("utf-8")
-    finally:
-        lib.sg_wipe_buffer(buf, _FIXED_SLOT_LEN)
+def _sign_caller_message(msg: bytes, handshake_key: bytes | None = None) -> bytes:
+    hs_key = handshake_key if handshake_key is not None else reconstruct_handshake_key()
+    if len(hs_key) != 32:
+        raise PermissionError("Sealed engine caller handshake secret unavailable.")
+    return hmac.new(hs_key, msg, hashlib.sha256).hexdigest().encode("ascii")
+
+
+def query_sealed_mode(lib: ctypes.CDLL, handshake_key: bytes | None = None) -> int:
+    """Authenticate current process against stripped sg_seal.dll and return mode (1 or 2)."""
+    nonce = secrets.token_hex(16).encode("ascii")
+    msg = b"SG::MODE::" + str(os.getpid()).encode("ascii") + b"::" + nonce
+    sig = _sign_caller_message(msg, handshake_key=handshake_key)
+    return int(lib.sg_cf_mode(nonce, len(nonce), sig, len(sig)))
+
+
+def execute_sealed_request(
+    method: str,
+    rel_path: str,
+    json_body: dict[str, Any] | None = None,
+    lib: ctypes.CDLL | None = None,
+    handshake_key: bytes | None = None,
+) -> tuple[int, str]:
+    """Execute Cloudflare API request inside stripped native Rust WinHTTP with zero Python secret exposure."""
+    dll = lib or _load_native_seal_dll()
+    if dll is None:
+        raise RuntimeError("Sealed Cloudflare native library is unavailable or failed integrity verification.")
+
+    method_b = method.upper().encode("ascii")
+    path_b = rel_path.encode("utf-8")
+    body_b = json.dumps(json_body, separators=(",", ":")).encode("utf-8") if json_body is not None else b""
+
+    buf_cap = 524288  # 512 KB initial buffer; expands automatically if large JSON list returned
+    while buf_cap <= 8 * 1024 * 1024:
+        nonce = secrets.token_hex(16).encode("ascii")
+        msg = b"SG::REQ::" + str(os.getpid()).encode("ascii") + b"::" + nonce + b"::" + method_b + b"::" + path_b
+        sig = _sign_caller_message(msg, handshake_key=handshake_key)
+
+        out_status = ctypes.c_int(0)
+        out_len = ctypes.c_size_t(0)
+        out_buf = ctypes.create_string_buffer(buf_cap)
+        rc = int(
+            dll.sg_cf_request(
+                nonce, len(nonce),
+                sig, len(sig),
+                method_b, len(method_b),
+                path_b, len(path_b),
+                body_b if body_b else None, len(body_b),
+                ctypes.byref(out_status),
+                out_buf, buf_cap,
+                ctypes.byref(out_len),
+            )
+        )
+        if rc == -6:
+            buf_cap = max(buf_cap * 2, int(out_len.value) + 4096)
+            continue
+        if rc == 0:
+            raw = bytes(out_buf.raw[: int(out_len.value)])
+            return int(out_status.value), raw.decode("utf-8", errors="replace")
+        if rc == -1:
+            raise PermissionError("Native engine halted: debugger or hardware breakpoint detected.")
+        if rc == -3:
+            raise PermissionError("Native block-only policy guard rejected disallowed API operation.")
+        if rc == -4:
+            raise PermissionError("Native engine rejected unauthorized caller signature.")
+        raise ConnectionError(f"Sealed WinHTTP transport error (code {rc}).")
+
+    raise BufferError("Cloudflare response exceeded maximum native transport buffer.")
 
 
 def get_cloudflare_transport_config() -> CloudflareTransportConfig:
-    """Resolve Cloudflare transport enforcing desktop Administrator privilege boundaries.
-
-    On Windows:
-    - Any unelevated / standard-user process receives `mode='admin_locked'` whenever
-      the Admin-only Cloudflare vault exists or when running as a compiled desktop build.
-    - Only Windows Administrator processes can unseal `%ProgramData%\\SentinelGateAI\\AdminLock`
-      + `HKLM\\SOFTWARE\\SentinelGateAI`.
-    """
+    """Resolve transport from stripped native sg_seal.dll (or .env Worker Relay / direct in dev source only)."""
     lib = _load_native_seal_dll()
-
-    if os.name == "nt" and not is_admin_process():
-        if is_admin_cf_store_present() or is_compiled_binary() or lib is not None:
-            return CloudflareTransportConfig(mode="admin_locked")
-    else:
-        admin_cfg = load_admin_cf_credentials()
-        if admin_cfg.is_ready():
-            return admin_cfg
-
-        if lib is not None:
-            mode_num = lib.sg_seal_mode()
-            if mode_num == 2:
-                w_url = _read_native_slot(lib, 2)
-                w_tok = _read_native_slot(lib, 3)
-                if w_url and w_tok:
-                    return CloudflareTransportConfig(mode="worker", worker_url=w_url, worker_token=w_tok)
-            elif mode_num == 1:
-                acct = _read_native_slot(lib, 0)
-                tok = _read_native_slot(lib, 1)
-                if acct and tok:
-                    return CloudflareTransportConfig(mode="direct", account_id=acct, api_token=tok)
-            elif mode_num == 3:
-                return CloudflareTransportConfig(mode="none")
+    if lib is not None:
+        try:
+            mode_code = query_sealed_mode(lib)
+            if mode_code == 2:
+                return CloudflareTransportConfig(mode="native_worker")
+            if mode_code == 1:
+                return CloudflareTransportConfig(mode="native_sealed")
+        except Exception:
             return CloudflareTransportConfig(mode="none")
+        return CloudflareTransportConfig(mode="none")
 
-    # Never read env vars when running from a compiled desktop executable
+    # Never read .env or env vars when running from a compiled desktop executable
     if is_compiled_binary():
         return CloudflareTransportConfig(mode="none")
 
-    w_url = (os.environ.get("SG_WORKER_URL") or "").strip().rstrip("/")
-    w_tok = (os.environ.get("SG_WORKER_TOKEN") or "").strip()
-    if w_url and w_tok:
-        return CloudflareTransportConfig(mode="worker", worker_url=w_url, worker_token=w_tok)
+    w_url, w_sec = read_worker_from_env_or_dotenv()
+    if w_url and w_sec:
+        return CloudflareTransportConfig(mode="worker", worker_url=w_url, worker_token=w_sec)
 
-    acct = (os.environ.get("CF_ACCOUNT_ID") or "").strip()
-    tok = (os.environ.get("CF_API_TOKEN") or "").strip()
+    acct, tok = read_cf_from_env_or_dotenv()
     if acct and tok:
         return CloudflareTransportConfig(mode="direct", account_id=acct, api_token=tok)
 
@@ -620,51 +1246,6 @@ def get_cloudflare_transport_config() -> CloudflareTransportConfig:
 
 
 def get_cloudflare_credentials() -> tuple[str, str]:
-    """Legacy tuple helper returning (account_id, api_token) when in direct mode."""
+    """Legacy helper returning empty strings when sealed natively (credentials never leave native code)."""
     cfg = get_cloudflare_transport_config()
     return cfg.account_id, cfg.api_token
-
-
-def interactive_admin_setup() -> int:
-    """Elevated Administrator setup prompt for Cloudflare API & Gemini API credentials."""
-    print("=== SentinelGate AI - Administrator Credential Setup ===")
-    if os.name == "nt" and not is_admin_process():
-        print("[ERROR] Windows Administrator privileges are required to lock Cloudflare credentials.")
-        return 5
-
-    already_locked = is_admin_cf_store_present()
-    if already_locked:
-        print("An Admin-locked Cloudflare store already exists on this PC (leave blank to keep).")
-
-    acct_id = input("Enter Cloudflare Account ID (or leave blank to keep/skip): ").strip()
-    cf_token = getpass.getpass("Enter Cloudflare API Token (hidden, leave blank to keep/skip): ").strip()
-    if acct_id and cf_token:
-        save_admin_cf_credentials(account_id=acct_id, api_token=cf_token)
-        print("[OK] Cloudflare credentials sealed in Admin/SYSTEM-only store (Machine DPAPI + HKLM + NTFS ACL).")
-    elif not already_locked:
-        print("[!] Cloudflare credentials skipped — re-run elevated setup anytime to configure.")
-
-    vault = ApiKeyVault()
-    has_gem = vault.get_masked_status()["keys"]["GEMINI_API_KEY"]["configured"]
-    prompt_suffix = " (leave blank to keep existing)" if has_gem else ""
-    gem_key = getpass.getpass(f"Enter Gemini AI API Key (hidden){prompt_suffix}: ").strip()
-    gem_backup = getpass.getpass("Enter optional Backup Gemini AI API Key (hidden, Enter to skip): ").strip()
-    if gem_key or gem_backup:
-        updates: dict[str, str] = {}
-        if gem_key:
-            updates["GEMINI_API_KEY"] = gem_key
-        if gem_backup:
-            updates["GEMINI_API_KEY_BACKUP"] = gem_backup
-        vault.update_credentials(updates)
-        if gem_key:
-            save_gemini_install_seed(gem_key, gem_backup)
-        print("[OK] Gemini AI API key encrypted in Windows DPAPI Vault.")
-    else:
-        print("[OK] Gemini AI API key configuration unchanged.")
-
-    return 0
-
-
-if __name__ == "__main__":
-    if "--interactive-setup" in sys.argv[1:]:
-        raise SystemExit(interactive_admin_setup())

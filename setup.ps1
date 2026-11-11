@@ -1,24 +1,13 @@
 <#
 .SYNOPSIS
-    Single-file developer & production setup script for SentinelGate AI.
+    Environment setup script for SentinelGate AI.
     Installs missing Python/Rust toolchains, creates .venv, installs Python packages,
-    Compiles Rust cf_validator.exe, prompts via Administrator UAC for Cloudflare & Gemini APIs
-    (locking Cloudflare credentials so standard desktop users cannot access them), runs tests,
-    and optionally builds SentinelGateAI-Setup.exe.
-.PARAMETER BuildSetup
-    Also compile the single self-contained SentinelGateAI-Setup.exe installer (with Rust & app embedded).
-.PARAMETER BuildExe
-    Alias for -BuildSetup.
+    compiles Rust cf_validator.exe, and runs the test suite.
 .PARAMETER SkipTests
     Skip running the automated unittest suite.
-.PARAMETER SkipCredentials
-    Skip interactive Cloudflare & Gemini API credential setup.
 #>
 param(
-    [switch]$BuildSetup,
-    [switch]$BuildExe,
-    [switch]$SkipTests,
-    [switch]$SkipCredentials
+    [switch]$SkipTests
 )
 
 $ErrorActionPreference = "Stop"
@@ -31,7 +20,7 @@ function Assert-LastExit($StepName) {
     }
 }
 
-Write-Host "=== SentinelGate AI - Unified Single-Script Setup ===" -ForegroundColor Cyan
+Write-Host "=== SentinelGate AI - Environment Setup ===" -ForegroundColor Cyan
 
 # 1. Ensure Python 3.12+ is available
 if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
@@ -84,42 +73,11 @@ Write-Host "[3/4] Compiling Rust cf_validator.exe and updating SHA-256 checksum.
 Assert-LastExit "build_rust_validator"
 
 if (-not $SkipTests) {
-    Write-Host "[4/5] Running automated unit & security test suite..." -ForegroundColor Cyan
+    Write-Host "[4/4] Running automated unit & security test suite..." -ForegroundColor Cyan
     & $VenvPython -m unittest discover -s tests -v
     Assert-LastExit "unittest"
 } else {
-    Write-Host "[4/5] Skipping unit tests (-SkipTests set)." -ForegroundColor Yellow
+    Write-Host "[4/4] Skipping unit tests (-SkipTests set)." -ForegroundColor Yellow
 }
 
-if (-not $SkipCredentials) {
-    Write-Host "[5/5] Configuring Cloudflare & Gemini APIs (UAC Administrator Lock for Cloudflare)..." -ForegroundColor Cyan
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
-    $isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
-    if ($isAdmin) {
-        & $VenvPython -m sentinelgate.config.cf_secrets --interactive-setup
-        Assert-LastExit "interactive-setup"
-    } else {
-        Write-Host "  Requesting Windows Administrator UAC elevation to seal Cloudflare credentials..." -ForegroundColor Yellow
-        try {
-            $proc = Start-Process -FilePath $VenvPython -ArgumentList "-m", "sentinelgate.config.cf_secrets", "--interactive-setup" -WorkingDirectory $Root -Verb RunAs -PassThru -Wait
-            if ($proc.ExitCode -ne 0) {
-                throw "Elevated credential setup exited with code $($proc.ExitCode)"
-            }
-        } catch {
-            Write-Host "  [!] Administrator UAC elevation was cancelled or failed: $($_.Exception.Message)" -ForegroundColor Red
-            Write-Host "      Cloudflare API remains locked until Administrator setup completes." -ForegroundColor Yellow
-        }
-    }
-} else {
-    Write-Host "[5/5] Skipping interactive credential setup (-SkipCredentials set)." -ForegroundColor Yellow
-}
-
-if ($BuildSetup -or $BuildExe) {
-    Write-Host "[PROD] Compiling single self-contained SentinelGateAI-Setup.exe..." -ForegroundColor Cyan
-    & $VenvPython (Join-Path $Root "build.py") --backend nuitka --only-setup-file
-    Assert-LastExit "build.py"
-}
-
-Write-Host "[OK] SentinelGate AI environment is ready." -ForegroundColor Green
+Write-Host "[OK] SentinelGate AI environment is ready. Run '.\.venv\Scripts\python.exe build.py' to build SentinelGateAI-Setup.exe." -ForegroundColor Green

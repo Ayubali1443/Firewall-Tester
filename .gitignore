@@ -8,9 +8,8 @@ __pycache__/
 venv/
 env/
 
-# Node / Web & Worker
+# Node / Web
 node_modules/
-worker/.wrangler/
 
 # Rust Validator Build & Compiled Binaries
 target/
@@ -31,6 +30,7 @@ nuitka-crash-report.xml
 # Secrets, DPAPI Vaults & Local Logs/Reports
 .env
 .env.*
+!.env.example
 *.dpapi
 *.log
 reports/

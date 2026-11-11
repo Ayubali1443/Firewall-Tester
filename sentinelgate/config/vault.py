@@ -138,29 +138,6 @@ def extract_legacy_cf_from_vault(vault_path: Path | None = None, purge: bool = F
         return "", ""
 
 
-_GEMINI_SEED_ENTROPY = b"SentinelGateAI::GeminiSeed::v1"
-
-
-def get_gemini_seed_path() -> Path:
-    """Return shared ProgramData seed path for setup-provided Gemini AI key ONLY (never Cloudflare)."""
-    prog_data = os.environ.get("ProgramData") or r"C:\ProgramData"
-    return Path(prog_data) / "SentinelGateAI" / "gemini_seed.dpapi"
-
-
-def save_gemini_install_seed(api_key: str, backup_key: str = "", seed_path: Path | None = None) -> None:
-    """Store initial Gemini API key seed via Machine DPAPI so any local user vault inherits it once."""
-    clean = {
-        "GEMINI_API_KEY": str(api_key or "").strip(),
-        "GEMINI_API_KEY_BACKUP": str(backup_key or "").strip(),
-    }
-    if not clean["GEMINI_API_KEY"]:
-        return
-    sp = seed_path or get_gemini_seed_path()
-    sp.parent.mkdir(parents=True, exist_ok=True)
-    raw = json.dumps(clean, separators=(",", ":")).encode("utf-8")
-    sp.write_bytes(dpapi_protect(raw, entropy=_GEMINI_SEED_ENTROPY, local_machine=True))
-
-
 class ApiKeyVault:
     """Manages DPAPI-encrypted storage exclusively for editable Gemini AI API keys."""
 
@@ -171,9 +148,7 @@ class ApiKeyVault:
 
     FORBIDDEN_FIELDS = ("CF_ACCOUNT_ID", "CF_API_TOKEN")
 
-    def __init__(self, vault_path: Path | None = None, seed_path: Path | None = None) -> None:
-        self._custom_vault = vault_path is not None
-        self._seed_path = seed_path or get_gemini_seed_path()
+    def __init__(self, vault_path: Path | None = None) -> None:
         self.vault_path = vault_path or (get_app_data_dir() / "vault.dpapi")
         self._ensure_migrated()
 
@@ -207,7 +182,9 @@ class ApiKeyVault:
         self.vault_path.write_bytes(encrypted)
 
     def _discover_legacy_gemini_keys(self) -> dict[str, str]:
-        """Search workspace legacy folders or project root for existing Gemini keys only."""
+        """Never auto-import Gemini keys in compiled installs (prompt only when app opens)."""
+        if is_compiled_binary():
+            return {}
         root = get_project_root()
         candidates = [
             root / ".env",
@@ -232,35 +209,16 @@ class ApiKeyVault:
             merged["GEMINI_API_KEY_BACKUP"] = gemini_keys[1]
         return merged
 
-    def _read_gemini_seed(self) -> dict[str, str]:
-        if self._custom_vault and self._seed_path == get_gemini_seed_path():
-            return {}
-        if not self._seed_path.exists():
-            return {}
-        try:
-            raw = dpapi_unprotect(
-                self._seed_path.read_bytes(),
-                entropy=_GEMINI_SEED_ENTROPY,
-                local_machine=True,
-            )
-            payload = json.loads(raw.decode("utf-8"))
-            if isinstance(payload, dict):
-                return {k: str(payload.get(k) or "").strip() for k in self.FIELDS}
-        except Exception:
-            return {}
-        return {}
-
     def _ensure_migrated(self) -> None:
         current = self._read_raw_vault()
         if current.get("GEMINI_API_KEY"):
             return
 
         discovered = self._discover_legacy_gemini_keys()
-        seeded = self._read_gemini_seed()
         for k in self.FIELDS:
             if not current.get(k):
                 env_val = (os.environ.get(k) or "").strip()
-                current[k] = env_val or seeded.get(k, "") or discovered.get(k, "")
+                current[k] = env_val or discovered.get(k, "")
 
         if any(current.values()):
             self._write_raw_vault(current)

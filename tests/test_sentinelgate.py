@@ -12,20 +12,15 @@ import unittest
 import build
 from sentinelgate.config.cf_secrets import (
     CloudflareTransportConfig,
-    _read_native_slot,
+    derive_build_handshake_parts,
+    execute_sealed_request,
     get_cloudflare_transport_config,
-    is_admin_cf_store_present,
-    load_admin_cf_credentials,
-    lock_path_admin_only,
-    save_admin_cf_credentials,
+    query_sealed_mode,
+    read_cf_from_env_or_dotenv,
+    read_worker_from_env_or_dotenv,
+    reconstruct_handshake_key,
 )
-from sentinelgate.config.vault import (
-    ApiKeyVault,
-    dpapi_protect,
-    dpapi_unprotect,
-    mask_secret,
-    save_gemini_install_seed,
-)
+from sentinelgate.config.vault import ApiKeyVault, dpapi_protect, dpapi_unprotect, mask_secret
 from sentinelgate.core.cleaner import (
     clean_category,
     deduplicate_terms_for_sync,
@@ -119,18 +114,53 @@ class SentinelGateCoreTests(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 vault.update_credentials({"CF_API_TOKEN": "attempted-overwrite"})
 
-    def test_sealed_cloudflare_native_dll_and_worker_redaction(self) -> None:
+    def test_sealed_cloudflare_native_dll_and_dotenv_isolation(self) -> None:
+        import os
+        import unittest.mock as mock
+
         fake_acct = "acct_9876543210fedcba9876543210fedcba"
         fake_tok = "cf_secret_token_ABC123XYZ789_very_sensitive"
-        fake_worker_url = "https://sg-relay.example.workers.dev"
-        fake_worker_tok = "relay_secret_XYZ_999888777"
+        hs_key = os.urandom(32)
+        wrong_key = os.urandom(32)
+
+        # Verify split handshake reconstruction
+        pa, pb = derive_build_handshake_parts(hs_key)
+        self.assertNotIn(hs_key, pa + pb)
+        self.assertEqual(reconstruct_handshake_key(pa, pb), hs_key)
+
+        # Verify workspace .env loads ACCOUNT_ID/API_TOKEN cleanly in source mode,
+        # but is ignored completely when running compiled binary!
+        env_acct, env_tok = read_cf_from_env_or_dotenv()
+        self.assertTrue(bool(env_acct and env_tok))
+        with mock.patch("sentinelgate.config.cf_secrets.is_compiled_binary", return_value=True), \
+             mock.patch("sentinelgate.config.cf_secrets._load_native_seal_dll", return_value=None):
+            compiled_cfg = get_cloudflare_transport_config()
+        self.assertEqual(compiled_cfg.mode, "none")
+
+        def bind_dll(path: Path) -> ctypes.CDLL:
+            lib = ctypes.CDLL(str(path))
+            lib.sg_cf_mode.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t]
+            lib.sg_cf_mode.restype = ctypes.c_int
+            lib.sg_cf_request.argtypes = [
+                ctypes.c_char_p, ctypes.c_size_t,
+                ctypes.c_char_p, ctypes.c_size_t,
+                ctypes.c_char_p, ctypes.c_size_t,
+                ctypes.c_char_p, ctypes.c_size_t,
+                ctypes.c_char_p, ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.c_char_p, ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_size_t),
+            ]
+            lib.sg_cf_request.restype = ctypes.c_int
+            return lib
 
         with tempfile.TemporaryDirectory() as td:
-            # 1. Test Direct Native Stripped Rust DLL sealing
+            # 1. Test Direct Native WinHTTP Stripped Rust DLL sealing
             dll_direct = Path(td) / "sg_seal_direct.dll"
             digest_d = build.compile_native_seal_dll(
                 account_id=fake_acct,
                 api_token=fake_tok,
+                handshake_key=hs_key,
                 out_dll=dll_direct,
                 write_hash_module=False,
             )
@@ -139,54 +169,113 @@ class SentinelGateCoreTests(unittest.TestCase):
             self.assertNotIn(fake_acct.encode("utf-8"), dll_bytes)
             self.assertNotIn(fake_tok.encode("utf-8"), dll_bytes)
 
-            lib_d = ctypes.CDLL(str(dll_direct))
-            lib_d.sg_seal_mode.restype = ctypes.c_int
-            lib_d.sg_unseal_slot.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t]
-            lib_d.sg_unseal_slot.restype = ctypes.c_int
-            lib_d.sg_wipe_buffer.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
-            self.assertEqual(lib_d.sg_seal_mode(), 1)
-            self.assertEqual(_read_native_slot(lib_d, 0), fake_acct)
-            self.assertEqual(_read_native_slot(lib_d, 1), fake_tok)
+            lib_d = bind_dll(dll_direct)
+            # No plaintext credential-getter exports may exist
+            self.assertFalse(hasattr(lib_d, "sg_unseal_slot"))
+            self.assertEqual(query_sealed_mode(lib_d, handshake_key=hs_key), 1)
+            # Wrong caller handshake fails (-4) even with the copied DLL
+            self.assertEqual(query_sealed_mode(lib_d, handshake_key=wrong_key), -4)
 
-            # 2. Test Zero-Token Worker Relay Native Stripped Rust DLL sealing
-            dll_worker = Path(td) / "sg_seal_worker.dll"
-            build.compile_native_seal_dll(
-                worker_url=fake_worker_url,
-                worker_token=fake_worker_tok,
-                out_dll=dll_worker,
-                write_hash_module=False,
-            )
-            w_bytes = dll_worker.read_bytes()
-            self.assertNotIn(fake_worker_url.encode("utf-8"), w_bytes)
-            self.assertNotIn(fake_worker_tok.encode("utf-8"), w_bytes)
+            with self.assertRaises(PermissionError):
+                execute_sealed_request("GET", "/rules", lib=lib_d, handshake_key=wrong_key)
 
-            lib_w = ctypes.CDLL(str(dll_worker))
-            lib_w.sg_seal_mode.restype = ctypes.c_int
-            lib_w.sg_unseal_slot.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t]
-            lib_w.sg_unseal_slot.restype = ctypes.c_int
-            lib_w.sg_wipe_buffer.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
-            self.assertEqual(lib_w.sg_seal_mode(), 2)
-            self.assertEqual(_read_native_slot(lib_w, 2), fake_worker_url)
-            self.assertEqual(_read_native_slot(lib_w, 3), fake_worker_tok)
-            self.assertEqual(_read_native_slot(lib_w, 0), "")
-            self.assertEqual(_read_native_slot(lib_w, 1), "")
+            # Native Rust block-only policy guard rejects dangerous mutations offline (-3)
+            for m, p, body in (
+                ("POST", "/rules", {"name": "bypass", "action": "allow", "enabled": True}),
+                ("PUT", "/rules/11111111-1111-1111-1111-111111111111", {"action": "block", "enabled": False}),
+                ("PATCH", "/lists/11111111-1111-1111-1111-111111111111", {"remove": [{"value": "x.com"}]}),
+                ("DELETE", "/lists/11111111-1111-1111-1111-111111111111", None),
+                ("GET", "/../admin", None),
+            ):
+                with self.assertRaises(PermissionError):
+                    execute_sealed_request(m, p, json_body=body, lib=lib_d, handshake_key=hs_key)
 
-            # Explicitly unload DLLs on Windows before temp directory cleanup
             kernel32 = ctypes.windll.kernel32
             kernel32.FreeLibrary.argtypes = [ctypes.c_void_p]
             kernel32.FreeLibrary(lib_d._handle)
+
+            # 1b. Test Worker Relay Native WinHTTP Stripped Rust DLL sealing (CF keys completely absent)
+            fake_wurl = "https://sentinelgate-relay.example.workers.dev"
+            fake_wsec = "sg_relay_secret_0123456789abcdef0123456789abcdef"
+            dll_worker = Path(td) / "sg_seal_worker.dll"
+            digest_w = build.compile_native_seal_dll(
+                worker_url=fake_wurl,
+                relay_secret=fake_wsec,
+                handshake_key=hs_key,
+                out_dll=dll_worker,
+                write_hash_module=False,
+            )
+            self.assertEqual(len(digest_w), 64)
+            w_bytes = dll_worker.read_bytes()
+            self.assertNotIn(fake_wurl.encode("utf-8"), w_bytes)
+            self.assertNotIn(fake_wsec.encode("utf-8"), w_bytes)
+            self.assertNotIn(b"api.cloudflare.com", w_bytes)
+            self.assertIn(b"CertGetCertificateChain", w_bytes)
+
+            lib_w = bind_dll(dll_worker)
+            self.assertFalse(hasattr(lib_w, "sg_unseal_slot"))
+            self.assertEqual(query_sealed_mode(lib_w, handshake_key=hs_key), 2)
+            self.assertEqual(query_sealed_mode(lib_w, handshake_key=wrong_key), -4)
             kernel32.FreeLibrary(lib_w._handle)
 
-        # 3. Verify Worker-mode client endpoints, headers, trust_env=False, and redaction
-        ro_worker = CloudflareReadOnlyClient(
-            CloudflareTransportConfig(mode="worker", worker_url=fake_worker_url, worker_token=fake_worker_tok)
+        # 2. Verify native_sealed & native_worker clients hold ZERO plaintext secrets in Python
+        ro_native = CloudflareReadOnlyClient(CloudflareTransportConfig(mode="native_sealed"))
+        self.assertTrue(ro_native.is_configured())
+        self.assertEqual(ro_native.account_id, "")
+        self.assertEqual(ro_native.api_token, "")
+        self.assertNotIn("Authorization", ro_native._session.headers)
+        with mock.patch("sentinelgate.core.cloudflare.execute_sealed_request", return_value=(200, '{"success":true,"result":[]}')):
+            vc = ro_native.verify_connection()
+            self.assertTrue(vc["ok"])
+
+        ro_nw = CloudflareReadOnlyClient(CloudflareTransportConfig(mode="native_worker"))
+        self.assertTrue(ro_nw.is_configured())
+        self.assertEqual(ro_nw.account_id, "")
+        self.assertEqual(ro_nw.api_token, "")
+        self.assertEqual(ro_nw.worker_token, "")
+        self.assertNotIn("X-SG-Relay-Key", ro_nw._session.headers)
+        with mock.patch("sentinelgate.core.cloudflare.execute_sealed_request", return_value=(200, '{"ok":true,"rule_count":3,"list_count":4}')):
+            vc_nw = ro_nw.verify_connection()
+            self.assertTrue(vc_nw["ok"])
+            self.assertEqual(vc_nw["rule_count"], 3)
+            self.assertEqual(vc_nw["list_count"], 4)
+
+        # 3. Verify Direct & Worker mode redaction + trust_env=False + .env helper
+        ro_direct = CloudflareReadOnlyClient(
+            CloudflareTransportConfig(mode="direct", account_id=fake_acct, api_token=fake_tok)
         )
-        self.assertFalse(ro_worker._session.trust_env)
-        self.assertEqual(ro_worker.rules_url, f"{fake_worker_url}/v1/rules")
-        self.assertEqual(ro_worker._session.headers.get("X-SG-Relay-Key"), fake_worker_tok)
-        redacted = ro_worker._redact(f"Error calling {fake_worker_url} with {fake_worker_tok}")
-        self.assertNotIn(fake_worker_url, redacted)
-        self.assertNotIn(fake_worker_tok, redacted)
+        self.assertFalse(ro_direct._session.trust_env)
+        redacted = ro_direct._redact(f"Error acct={fake_acct} tok={fake_tok}")
+        self.assertNotIn(fake_acct, redacted)
+        self.assertNotIn(fake_tok, redacted)
+
+        ro_w = CloudflareReadOnlyClient(
+            CloudflareTransportConfig(
+                mode="worker",
+                worker_url="https://sentinelgate-relay.example.workers.dev",
+                worker_token="relay-sec-999",
+            )
+        )
+        self.assertFalse(ro_w._session.trust_env)
+        red_w = ro_w._redact("Err https://sentinelgate-relay.example.workers.dev key=relay-sec-999")
+        self.assertNotIn("sentinelgate-relay.example.workers.dev", red_w)
+        self.assertNotIn("relay-sec-999", red_w)
+
+        with tempfile.TemporaryDirectory() as env_td:
+            (Path(env_td) / ".env").write_text(
+                'WORKER_URL="https://sentinelgate-relay.test.workers.dev/"\nRELAY_CLIENT_SECRET="sec123"\n',
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("WORKER_URL", None)
+                os.environ.pop("SG_WORKER_URL", None)
+                os.environ.pop("RELAY_URL", None)
+                os.environ.pop("RELAY_CLIENT_SECRET", None)
+                os.environ.pop("SG_WORKER_TOKEN", None)
+                os.environ.pop("WORKER_TOKEN", None)
+                w_u, w_s = read_worker_from_env_or_dotenv(Path(env_td))
+                self.assertEqual(w_u, "https://sentinelgate-relay.test.workers.dev")
+                self.assertEqual(w_s, "sec123")
 
     def test_single_file_rust_setup_installer_build_and_silent_extract(self) -> None:
         import subprocess
@@ -210,27 +299,94 @@ class SentinelGateCoreTests(unittest.TestCase):
             )
             self.assertEqual(res.returncode, 0)
             installed_exe = install_target / "SentinelGateAI.exe"
+            uninstall_exe = install_target / "Uninstall.exe"
             self.assertTrue(installed_exe.exists())
+            self.assertTrue(uninstall_exe.exists())
             self.assertEqual(installed_exe.read_bytes(), dummy_bytes)
 
-            # Passing Cloudflare credentials in non-admin context must fail cleanly (exit 5)
-            nonadmin_cf = subprocess.run(
-                [
-                    str(out),
-                    "--silent",
-                    "--no-shortcuts",
-                    "--cf-account",
-                    "acct_123",
-                    "--cf-token",
-                    "tok_123",
-                    "--install-dir",
-                    str(td_path / "inst_nonadmin"),
-                ],
+            # Verify uninstall cleans installed binary & directory cleanly
+            uninst_res = subprocess.run(
+                [str(out), "--uninstall", "--silent", "--no-shortcuts", "--install-dir", str(install_target)],
                 capture_output=True,
                 text=True,
                 timeout=20,
             )
-            self.assertEqual(nonadmin_cf.returncode, 5)
+            self.assertEqual(uninst_res.returncode, 0)
+            self.assertFalse(installed_exe.exists())
+            self.assertFalse(install_target.exists())
+
+            # Verify installer never targets Program Files, ProgramData, HKLM writes, or Admin elevation
+            installer_src = (Path(__file__).resolve().parent.parent / "sentinelgate" / "installer" / "src" / "main.rs").read_text(encoding="utf-8")
+            self.assertNotIn("Program Files", installer_src)
+            self.assertNotIn("ProgramData", installer_src)
+            self.assertNotIn("requireAdministrator", installer_src)
+            self.assertNotIn("runas", installer_src.lower())
+            self.assertIn("HKEY_CURRENT_USER", installer_src)
+            self.assertIn(b"asInvoker", out.read_bytes())
+
+            # Verify HKCU Uninstall registration + Uninstall.exe direct cleanup + self-removal
+            import os
+            import time
+            import winreg
+
+            test_reg_key = rf"Software\SentinelGateAI_UnitTest_{os.getpid()}"
+            install_target2 = td_path / "installed_app2"
+            try:
+                subprocess.run(
+                    [
+                        str(out),
+                        "--silent",
+                        "--no-shortcuts",
+                        "--install-dir",
+                        str(install_target2),
+                        "--reg-key",
+                        test_reg_key,
+                    ],
+                    check=True,
+                    timeout=20,
+                )
+                uninst2 = install_target2 / "Uninstall.exe"
+                self.assertTrue(uninst2.exists())
+                self.assertTrue((install_target2 / "SentinelGateAI.exe").exists())
+
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, test_reg_key) as k:
+                    self.assertEqual(winreg.QueryValueEx(k, "DisplayName")[0], "SentinelGate AI")
+                    self.assertEqual(winreg.QueryValueEx(k, "InstallLocation")[0], str(install_target2))
+                    self.assertEqual(winreg.QueryValueEx(k, "UninstallString")[0], f'"{uninst2}" --uninstall')
+                    self.assertEqual(
+                        winreg.QueryValueEx(k, "QuietUninstallString")[0],
+                        f'"{uninst2}" --uninstall --silent',
+                    )
+                    self.assertEqual(winreg.QueryValueEx(k, "NoModify")[0], 1)
+                    self.assertEqual(winreg.QueryValueEx(k, "NoRepair")[0], 1)
+                    self.assertGreaterEqual(winreg.QueryValueEx(k, "EstimatedSize")[0], 1)
+                    with self.assertRaises(FileNotFoundError):
+                        winreg.QueryValueEx(k, "NoRemove")
+
+                res_u2 = subprocess.run(
+                    [str(uninst2), "--uninstall", "--silent", "--no-shortcuts", "--reg-key", test_reg_key],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                self.assertEqual(res_u2.returncode, 0)
+                self.assertFalse((install_target2 / "SentinelGateAI.exe").exists())
+
+                with self.assertRaises(FileNotFoundError):
+                    winreg.OpenKey(winreg.HKEY_CURRENT_USER, test_reg_key)
+
+                # Wait briefly for detached PowerShell retry loop to remove Uninstall.exe & folder
+                for _ in range(25):
+                    if not uninst2.exists() and not install_target2.exists():
+                        break
+                    time.sleep(0.2)
+                self.assertFalse(uninst2.exists())
+                self.assertFalse(install_target2.exists())
+            finally:
+                try:
+                    winreg.DeleteKey(winreg.HKEY_CURRENT_USER, test_reg_key)
+                except OSError:
+                    pass
 
     def test_security_invariants_no_allow_no_delete_uptester_readonly(self) -> None:
         storage = StorageManager()
@@ -252,6 +408,8 @@ class SentinelGateCoreTests(unittest.TestCase):
             self.assertFalse(hasattr(UptesterService, forbidden))
 
     def test_flask_api_auth_and_block_only_guards(self) -> None:
+        import unittest.mock as mock
+
         app, token = create_app(session_token="unit-test-token-123")
         client = app.test_client()
 
@@ -260,7 +418,8 @@ class SentinelGateCoreTests(unittest.TestCase):
         self.assertEqual(unauth.status_code, 401)
 
         # Authenticated overview returns ok without leaking seal internals
-        ov = client.get("/api/overview", headers={"X-SG-Token": token})
+        with mock.patch("sentinelgate.server.get_cloudflare_transport_config", return_value=CloudflareTransportConfig(mode="none")):
+            ov = client.get("/api/overview", headers={"X-SG-Token": token})
         self.assertEqual(ov.status_code, 200)
         ov_json = ov.get_json()
         self.assertTrue(ov_json["ok"])
@@ -284,12 +443,14 @@ class SentinelGateCoreTests(unittest.TestCase):
         self.assertNotIn("CF_API_TOKEN", vs.get("keys", {}))
         self.assertNotIn("CF_ACCOUNT_ID", vs.get("keys", {}))
 
-        # UI HTML and JS never render 'NOT SEALED'
+        # UI HTML and JS never render 'NOT SEALED' and include Gemini first-launch onboarding modal
         with client.get("/") as r_html:
             ui_html = r_html.get_data(as_text=True)
         with client.get("/assets/app.js") as r_js:
             ui_js = r_js.get_data(as_text=True)
         self.assertIn("SEALED &amp; LOCKED", ui_html)
+        self.assertIn("gemini-setup-modal", ui_html)
+        self.assertIn("submitGeminiPromptModal", ui_js)
         self.assertNotIn("NOT SEALED", ui_html)
         self.assertNotIn("NOT SEALED", ui_js)
 
@@ -637,113 +798,300 @@ class SentinelGateCoreTests(unittest.TestCase):
         self.assertTrue(any("88/100" in w for w in q["warnings"]))
         self.assertTrue(any("Auto-sharding lists near cap" in w for w in q["warnings"]))
 
-    def test_admin_locked_cloudflare_store_acl_and_gemini_setup_seed(self) -> None:
+    def test_prebuild_live_credential_verification_and_env_hardening(self) -> None:
         import os
+        import unittest.mock as mock
+        from sentinelgate.main import _strip_proxy_env_overrides
+
+        # 1. Invalid Worker / Cloudflare credentials fail pre-build live check before embedding
+        with mock.patch("build.CloudflareReadOnlyClient.verify_connection", return_value={"ok": False, "error": "HTTP 401 Unauthorized"}):
+            res_bad_w = build.verify_credentials_before_build(
+                worker_url="https://sentinelgate-relay.example.workers.dev",
+                relay_secret="bad_sec",
+            )
+        self.assertFalse(res_bad_w["ok"])
+        self.assertFalse(res_bad_w["cf_ok"])
+
+        with mock.patch("build.CloudflareReadOnlyClient.verify_connection", return_value={"ok": False, "error": "HTTP 401 Invalid token"}):
+            res_bad_cf = build.verify_credentials_before_build(account_id="acct_x", api_token="bad_tok")
+        self.assertFalse(res_bad_cf["ok"])
+        self.assertFalse(res_bad_cf["cf_ok"])
+
+        # 2. Valid Worker Relay must pass health check AND return 401 when relay secret is wrong
+        with mock.patch("build.CloudflareReadOnlyClient.verify_connection", return_value={"ok": True, "rule_count": 4}), \
+             mock.patch("build.CloudflareReadOnlyClient.get_lists", return_value={"Proxies+block": "uuid-1", "AI+block": "uuid-2"}), \
+             mock.patch("requests.Session.get", return_value=mock.Mock(status_code=401)):
+            res_ok = build.verify_credentials_before_build(
+                worker_url="https://sentinelgate-relay.example.workers.dev",
+                relay_secret="good_sec",
+            )
+        self.assertTrue(res_ok["ok"])
+        self.assertEqual(res_ok["mode"], "worker")
+        self.assertEqual(res_ok["rule_count"], 4)
+        self.assertEqual(res_ok["list_count"], 2)
+
+        # 2b. Fail closed if Worker endpoint does not enforce 401 auth
+        with mock.patch("build.CloudflareReadOnlyClient.verify_connection", return_value={"ok": True, "rule_count": 4}), \
+             mock.patch("requests.Session.get", return_value=mock.Mock(status_code=200)):
+            res_open_worker = build.verify_credentials_before_build(
+                worker_url="https://sentinelgate-relay.example.workers.dev",
+                relay_secret="good_sec",
+            )
+        self.assertFalse(res_open_worker["ok"])
+
+        # 3. Fail-closed: build refuses to embed raw direct CF keys when Worker Relay is unconfigured
+        with mock.patch("build.read_worker_from_env_or_dotenv", return_value=("", "")):
+            with self.assertRaises(RuntimeError):
+                build.prepare_native_seal(skip_live_check=True, allow_unsafe_direct=False)
+
+        # 3b. Non-interactive prepare_native_seal in Worker mode reads .env cleanly with zero input() prompts
+        def forbid_prompt(*_a, **_kw):
+            raise AssertionError("Build must be 100% non-interactive!")
+
+        try:
+            with mock.patch("builtins.input", side_effect=forbid_prompt), \
+                 mock.patch(
+                     "build.read_worker_from_env_or_dotenv",
+                     return_value=("https://sentinelgate-relay.example.workers.dev", "relay_secret_123456"),
+                 ), \
+                 mock.patch("build.verify_credentials_before_build", return_value={"ok": True, "rule_count": 2, "list_count": 5}):
+                build.prepare_native_seal(skip_live_check=False)
+        finally:
+            build.cleanup_build_artifacts()
+
+        # 4. Startup env hardening removes MITM proxy & debugger injection variables
+        with mock.patch.dict(os.environ, {
+            "HTTPS_PROXY": "http://127.0.0.1:8080",
+            "REQUESTS_CA_BUNDLE": "C:\\evil\\fiddler.pem",
+            "PYTHONINSPECT": "1",
+            "PYTHONBREAKPOINT": "pdb.set_trace",
+        }):
+            _strip_proxy_env_overrides()
+            for var in ("HTTPS_PROXY", "REQUESTS_CA_BUNDLE", "PYTHONINSPECT", "PYTHONBREAKPOINT"):
+                self.assertNotIn(var, os.environ)
+
+    def test_post_install_editable_json_adds_without_cf_deletions(self) -> None:
+        import json
         import unittest.mock as mock
 
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
-            vault_fp = td_path / "AdminLock" / "cf_admin.dpapi"
-            ent = b"0123456789abcdef0123456789abcdef"
+            data_dir = td_path / "installed_app" / "data"
+            app_dir = td_path / "local_appdata"
 
-            # 1. Non-admin cannot save Cloudflare Admin credentials
-            with mock.patch("sentinelgate.config.cf_secrets.is_admin_process", return_value=False):
-                with self.assertRaises(PermissionError):
-                    save_admin_cf_credentials(
-                        account_id="acct_x",
-                        api_token="tok_secret",
-                        vault_path=vault_fp,
-                        entropy_bytes=ent,
-                    )
+            with mock.patch("sentinelgate.core.storage.is_compiled_binary", return_value=True):
+                st = StorageManager(data_dir=data_dir, app_data_dir=app_dir)
 
-            # 2. Real Win32 SDDL Admin-only ACL blocks non-admin reads at the OS kernel level
-            acl_fp = td_path / "kernel_locked.dpapi"
-            acl_fp.write_bytes(b"locked-secret-blob")
-            try:
-                lock_path_admin_only(acl_fp, is_dir=False)
-                if os.name == "nt":
-                    with self.assertRaises(PermissionError):
-                        acl_fp.read_bytes()
-                    self.assertTrue(is_admin_cf_store_present(vault_path=acl_fp))
-            finally:
-                # Restore writable DACL so TemporaryDirectory cleans up cleanly
-                if os.name == "nt":
-                    from sentinelgate.config.cf_secrets import _SE_FILE_OBJECT, _apply_sddl_dacl
+            # 1. Starter editable JSON files are materialized even in compiled/installed builds
+            for fname in ("dns_blocklist.json", "search_blocklist.json", "dns_uptime_sites.json", "search_uptime_terms.json"):
+                self.assertTrue((data_dir / fname).exists(), f"Missing editable JSON: {fname}")
 
-                    _apply_sddl_dacl(str(acl_fp), _SE_FILE_OBJECT, "D:P(A;;FA;;;WD)")
+            # 2. User edits dns_blocklist.json to add custom domain (+ ignored allow attempt)
+            dns_raw = json.loads((data_dir / "dns_blocklist.json").read_text(encoding="utf-8"))
+            dns_raw["Proxies+block"]["domains"].append("custom-added-proxy.org")
+            dns_raw["AllowHack+allow"] = {"category": "AllowHack", "action": "allow", "domains": ["google.com"]}
+            (data_dir / "dns_blocklist.json").write_text(json.dumps(dns_raw, indent=4), encoding="utf-8")
 
-            # 3. Admin write -> Machine DPAPI + entropy roundtrip succeeds only when elevated
-            with mock.patch("sentinelgate.config.cf_secrets.is_admin_process", return_value=True), \
-                 mock.patch("sentinelgate.config.cf_secrets.lock_path_admin_only"):
-                save_admin_cf_credentials(
-                    account_id="acct_admin_999",
-                    api_token="cf_tok_hidden_admin_only_777",
-                    vault_path=vault_fp,
-                    entropy_bytes=ent,
+            loaded_dns = st.load_dns_blocklist()
+            self.assertIn("custom-added-proxy.org", loaded_dns["Proxies+block"]["domains"])
+            self.assertNotIn("AllowHack+allow", loaded_dns)
+
+            # User now DELETES both custom-added-proxy.org and Proxies+block from JSON:
+            # monotonic DPAPI overlay + baseline MUST keep them intact!
+            del dns_raw["Proxies+block"]
+            (data_dir / "dns_blocklist.json").write_text(json.dumps(dns_raw, indent=4), encoding="utf-8")
+            loaded_after_del = st.load_dns_blocklist()
+            self.assertIn("Proxies+block", loaded_after_del)
+            self.assertIn("custom-added-proxy.org", loaded_after_del["Proxies+block"]["domains"])
+            self.assertIn("croxyproxy.com", loaded_after_del["Proxies+block"]["domains"])
+
+            # 3. User edits search_blocklist.json to add keyword, then deletes it & category from JSON
+            search_raw = json.loads((data_dir / "search_blocklist.json").read_text(encoding="utf-8"))
+            search_raw["Web Proxies+block"]["terms"].append("customsearchvector")
+            (data_dir / "search_blocklist.json").write_text(json.dumps(search_raw, indent=4), encoding="utf-8")
+            loaded_search = st.load_search_blocklist()
+            self.assertIn("customsearchvector", loaded_search["Web Proxies+block"]["terms"])
+
+            del search_raw["Web Proxies+block"]
+            (data_dir / "search_blocklist.json").write_text(json.dumps(search_raw, indent=4), encoding="utf-8")
+            loaded_search_after_del = st.load_search_blocklist()
+            self.assertIn("Web Proxies+block", loaded_search_after_del)
+            self.assertIn("customsearchvector", loaded_search_after_del["Web Proxies+block"]["terms"])
+            self.assertIn("web proxy", loaded_search_after_del["Web Proxies+block"]["terms"])
+
+            # 4. Cloudflare DNS policy sync preserves already-bound $list_ids even if absent from dns_data
+            writer = CloudflarePolicyWriter("acct_1", "tok_1")
+            existing_cf_rules = [
+                {
+                    "id": "rule-dns-1",
+                    "name": "automated_block",
+                    "action": "block",
+                    "enabled": True,
+                    "traffic": "any(dns.domains[*] in $11111111-1111-1111-1111-111111111111)",
+                }
+            ]
+            captured_puts = []
+
+            def fake_put(_url: str, json=None, **_kw):
+                captured_puts.append(json)
+                return mock.Mock(status_code=200, json=lambda: {"success": True, "result": {"id": "rule-dns-1"}})
+
+            with mock.patch.object(writer, "get_rules", return_value=existing_cf_rules), \
+                 mock.patch.object(writer._session, "put", side_effect=fake_put):
+                ok_sync = writer.sync_dns_block_policy(
+                    {"Custom+block": {"action": "block", "domains": []}},
+                    {"Custom+block": "22222222-2222-2222-2222-222222222222"},
                 )
-            raw_blob = vault_fp.read_bytes()
-            self.assertNotIn(b"cf_tok_hidden_admin_only_777", raw_blob)
-            self.assertNotIn(b"acct_admin_999", raw_blob)
+            self.assertTrue(ok_sync)
+            self.assertEqual(len(captured_puts), 1)
+            self.assertIn("$11111111-1111-1111-1111-111111111111", captured_puts[0]["traffic"])
+            self.assertIn("$22222222-2222-2222-2222-222222222222", captured_puts[0]["traffic"])
 
-            with mock.patch("sentinelgate.config.cf_secrets.is_admin_process", return_value=True):
-                loaded_admin = load_admin_cf_credentials(vault_path=vault_fp, entropy_bytes=ent)
-            self.assertTrue(loaded_admin.is_ready())
-            self.assertEqual(loaded_admin.mode, "direct")
-            self.assertEqual(loaded_admin.account_id, "acct_admin_999")
-            self.assertEqual(loaded_admin.api_token, "cf_tok_hidden_admin_only_777")
+            # 5. Editable uptime JSONs apply edits immediately after install
+            up_raw = json.loads((data_dir / "dns_uptime_sites.json").read_text(encoding="utf-8"))
+            up_raw["Tech+allow"]["domains"].append("mycustomdocs.org")
+            (data_dir / "dns_uptime_sites.json").write_text(json.dumps(up_raw, indent=4), encoding="utf-8")
+            self.assertIn("mycustomdocs.org", st.load_dns_uptime_sites()["Tech+allow"]["domains"])
 
-            with mock.patch("sentinelgate.config.cf_secrets.is_admin_process", return_value=False):
-                locked_cfg = load_admin_cf_credentials(vault_path=vault_fp, entropy_bytes=ent)
-            self.assertTrue(locked_cfg.is_admin_locked())
-            self.assertFalse(locked_cfg.is_ready())
-            self.assertEqual(locked_cfg.api_token, "")
+            # 6. Nuitka __compiled__ / NUITKA_ONEFILE_PARENT resolves persistent install dir instead of temp exe dir
+            import os
+            import sentinelgate.config.paths as sg_paths
 
-            # 4. When Admin store is present, non-admin get_cloudflare_transport_config returns admin_locked even with env vars
-            with mock.patch("sentinelgate.config.cf_secrets.is_admin_process", return_value=False), \
-                 mock.patch("sentinelgate.config.cf_secrets.is_admin_cf_store_present", return_value=True), \
-                 mock.patch.dict(os.environ, {"CF_ACCOUNT_ID": "env_acct", "CF_API_TOKEN": "env_tok"}):
-                cfg = get_cloudflare_transport_config()
-            self.assertEqual(cfg.mode, "admin_locked")
-            self.assertEqual(cfg.api_token, "")
+            fake_compiled = types.SimpleNamespace(containing_dir=str(td_path / "perm_install"))
+            with mock.patch.dict(sg_paths.__dict__, {"__compiled__": fake_compiled}), \
+                 mock.patch.object(sg_paths.sys, "executable", str(td_path / "temp_onefile" / "app.exe")):
+                self.assertEqual(sg_paths.get_project_root(), (td_path / "perm_install").resolve())
 
-            # 5. Gemini setup seed initializes per-user vault cleanly and keeps Gemini editable
-            seed_fp = td_path / "gemini_seed.dpapi"
-            user_vault_fp = td_path / "user_vault.dpapi"
-            save_gemini_install_seed("AIzaSetupSeedKey999", seed_path=seed_fp)
-            user_vault = ApiKeyVault(vault_path=user_vault_fp, seed_path=seed_fp)
-            self.assertEqual(user_vault.get_credentials()["GEMINI_API_KEY"], "AIzaSetupSeedKey999")
+            # Simulate Nuitka --onefile where submodule containing_dir fell back to temp dir while NUITKA_ONEFILE_PARENT holds parent PID
+            temp_fallback = types.SimpleNamespace(containing_dir=str(td_path / "temp_onefile"))
+            with mock.patch.dict(sg_paths.__dict__, {"__compiled__": temp_fallback}), \
+                 mock.patch.dict(os.environ, {"NUITKA_ONEFILE_PARENT": str(os.getpid())}):
+                resolved_parent = sg_paths.get_project_root()
+                self.assertEqual(resolved_parent, sg_paths._query_process_dir_win32(os.getpid()))
+                self.assertNotEqual(resolved_parent, (td_path / "temp_onefile").resolve())
 
-            # 6. Admin-Vault native sg_seal.dll compiles in mode 3 with zero embedded CF secrets
-            dll_vault = td_path / "sg_seal_admin_vault.dll"
-            build.compile_native_seal_dll(admin_vault=True, out_dll=dll_vault, write_hash_module=False)
-            lib_v = ctypes.CDLL(str(dll_vault))
-            lib_v.sg_seal_mode.restype = ctypes.c_int
-            lib_v.sg_unseal_slot.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t]
-            lib_v.sg_unseal_slot.restype = ctypes.c_int
-            lib_v.sg_wipe_buffer.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
-            self.assertEqual(lib_v.sg_seal_mode(), 3)
-            self.assertEqual(_read_native_slot(lib_v, 0), "")
-            self.assertEqual(_read_native_slot(lib_v, 1), "")
-            ctypes.windll.kernel32.FreeLibrary.argtypes = [ctypes.c_void_p]
-            ctypes.windll.kernel32.FreeLibrary(lib_v._handle)
+            # 7. Built-in JSON editor API endpoints support read/save while rejecting allow-listing
+            with mock.patch("sentinelgate.core.storage.get_workspace_data_dir", return_value=data_dir), \
+                 mock.patch("sentinelgate.core.storage.get_app_data_dir", return_value=app_dir):
+                app, tok = create_app(session_token="json-editor-tok")
+                client = app.test_client()
+                r_bad_name = client.get("/api/storage/json/secret.txt", headers={"X-SG-Token": tok})
+                self.assertEqual(r_bad_name.status_code, 400)
 
-        # 7. UI & API cleanly reflect admin_locked state & relaunch-admin UAC refusal
-        app, token = create_app(session_token="admin-lock-test-tok")
-        client = app.test_client()
-        with mock.patch("sentinelgate.server.get_cloudflare_transport_config", return_value=CloudflareTransportConfig(mode="admin_locked")), \
-             mock.patch("sentinelgate.server.is_admin_process", return_value=False):
-            ov = client.get("/api/overview", headers={"X-SG-Token": token}).get_json()
-            self.assertFalse(ov["is_admin"])
-            self.assertTrue(ov["cloudflare"]["admin_locked"])
-            self.assertFalse(ov["cloudflare"]["ready"])
+                r_allow = client.post(
+                    "/api/storage/json/dns_blocklist.json",
+                    json={"content": json.dumps({"Bypass+allow": {"action": "allow", "domains": ["x.com"]}})},
+                    headers={"X-SG-Token": tok},
+                )
+                self.assertEqual(r_allow.status_code, 403)
 
-            vt = client.post("/api/vault/test", headers={"X-SG-Token": token}).get_json()
-            self.assertTrue(vt["cloudflare"]["admin_locked"])
-            self.assertFalse(vt["cloudflare"]["ok"])
+                r_get = client.get("/api/storage/json/search_blocklist.json", headers={"X-SG-Token": tok})
+                self.assertEqual(r_get.status_code, 200)
+                self.assertEqual(r_get.get_json()["filename"], "search_blocklist.json")
 
-            with mock.patch("sentinelgate.server.ctypes.windll.shell32.ShellExecuteW", return_value=5):
-                rl = client.post("/api/system/relaunch-admin", headers={"X-SG-Token": token})
-                self.assertEqual(rl.status_code, 403)
+                ui_html = client.get("/").get_data(as_text=True)
+                self.assertIn("view-jsoneditor", ui_html)
+                self.assertIn("saveJsonEditorFile", ui_html)
+
+    def test_worker_relay_js_auth_and_block_only_rules(self) -> None:
+        import json
+        import shutil
+        import subprocess
+
+        root = Path(__file__).resolve().parent.parent
+        worker_js = root / "worker" / "sentinelgate-relay.js"
+        self.assertTrue(worker_js.exists())
+        self.assertTrue((root / "worker" / "wrangler.toml").exists())
+        self.assertTrue((root / "worker" / "setup-worker.ps1").exists())
+        self.assertTrue((root / "worker" / "README.md").exists())
+        self.assertTrue((root / ".env.example").exists())
+
+        node_bin = shutil.which("node")
+        if not node_bin:
+            self.skipTest("Node.js not available for executing worker JS tests")
+
+        harness = r"""
+import assert from "node:assert/strict";
+import worker from %WORKER_URI%;
+
+const ENV = {
+  CF_ACCOUNT_ID: "acct-secret-123",
+  CF_API_TOKEN: "tok-secret-456",
+  RELAY_CLIENT_SECRET: "relay-sec-789",
+};
+
+const UPSTREAM_RULES = [
+  { id: "11111111-1111-1111-1111-111111111111", name: "automated_http_search_block_p1", action: "block", enabled: true },
+  { id: "22222222-2222-2222-2222-222222222222", name: "automated_http_search_block_p2", action: "block", enabled: true },
+];
+
+globalThis.fetch = async (url, init = {}) => {
+  assert(url.includes("api.cloudflare.com/client/v4/accounts/acct-secret-123/gateway"));
+  assert.equal(init.headers?.Authorization, "Bearer tok-secret-456");
+  if (url.includes("/rules?per_page=100") && (init.method || "GET") === "GET") {
+    return new Response(JSON.stringify({ success: true, result: UPSTREAM_RULES }), { status: 200 });
+  }
+  if (url.includes("/lists?per_page=100")) {
+    return new Response(JSON.stringify({ success: true, result: [{ id: "33333333-3333-3333-3333-333333333333", name: "Proxies+block" }] }), { status: 200 });
+  }
+  return new Response(JSON.stringify({ success: true, result: { id: "ok" } }), { status: 200 });
+};
+
+// 1. Missing or invalid relay secret -> 401
+let r = await worker.fetch(new Request("https://w.example/v1/health"), ENV);
+assert.equal(r.status, 401);
+r = await worker.fetch(new Request("https://w.example/v1/health", { headers: { "X-SG-Relay-Key": "wrong" } }), ENV);
+assert.equal(r.status, 401);
+
+// 2. Valid health check returns counts and NEVER exposes CF keys
+r = await worker.fetch(new Request("https://w.example/v1/health", { headers: { "X-SG-Relay-Key": "relay-sec-789" } }), ENV);
+assert.equal(r.status, 200);
+const h = await r.json();
+assert.equal(h.ok, true);
+assert.equal(h.rule_count, 2);
+assert.equal(h.list_count, 1);
+
+// 3. Block-only / append-only enforcement -> 403 on allow, disable, list remove, or primary rule delete
+for (const [method, path, body] of [
+  ["POST", "/v1/lists", { name: "x", type: "IP" }],
+  ["PATCH", "/v1/lists/33333333-3333-3333-3333-333333333333", { remove: [{ value: "x.com" }] }],
+  ["POST", "/v1/rules", { name: "bypass", action: "allow", enabled: true }],
+  ["PUT", "/v1/rules/11111111-1111-1111-1111-111111111111", { action: "block", enabled: false }],
+  ["DELETE", "/v1/rules/11111111-1111-1111-1111-111111111111", null],
+]) {
+  const req = new Request(`https://w.example${path}`, {
+    method,
+    headers: { "X-SG-Relay-Key": "relay-sec-789", "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const res = await worker.fetch(req, ENV);
+  assert.equal(res.status, 403, `Expected 403 for ${method} ${path}`);
+}
+
+// 4. Allowed append & trailing _p2 deletion while active primary exists -> 200
+r = await worker.fetch(new Request("https://w.example/v1/lists/33333333-3333-3333-3333-333333333333", {
+  method: "PATCH",
+  headers: { "X-SG-Relay-Key": "relay-sec-789", "Content-Type": "application/json" },
+  body: JSON.stringify({ append: [{ value: "bad.example" }] }),
+}), ENV);
+assert.equal(r.status, 200);
+
+r = await worker.fetch(new Request("https://w.example/v1/rules/22222222-2222-2222-2222-222222222222", {
+  method: "DELETE",
+  headers: { "X-SG-Relay-Key": "relay-sec-789" },
+}), ENV);
+assert.equal(r.status, 200);
+console.log("WORKER_JS_OK");
+""".replace("%WORKER_URI%", json.dumps(worker_js.as_uri()))
+
+        proc = subprocess.run(
+            [node_bin, "--input-type=module", "-e", harness],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(proc.returncode, 0, f"Node Worker test failed:\n{proc.stdout}\n{proc.stderr}")
+        self.assertIn("WORKER_JS_OK", proc.stdout)
 
 
 if __name__ == "__main__":

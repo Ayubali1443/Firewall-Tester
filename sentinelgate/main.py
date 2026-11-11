@@ -16,7 +16,7 @@ from sentinelgate.server import create_app
 
 
 def _strip_proxy_env_overrides() -> None:
-    """Prevent HTTPS_PROXY / CA-bundle environment variables from intercepting Cloudflare tokens."""
+    """Prevent proxy, CA-bundle, and Python debugger injection env vars from exposing secrets."""
     for key in (
         "HTTP_PROXY",
         "HTTPS_PROXY",
@@ -26,6 +26,10 @@ def _strip_proxy_env_overrides() -> None:
         "CURL_CA_BUNDLE",
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
+        "PYTHONINSPECT",
+        "PYTHONBREAKPOINT",
+        "PYTHONSTARTUP",
+        "PYTHONVERBOSE",
     ):
         os.environ.pop(key, None)
         os.environ.pop(key.lower(), None)
@@ -41,12 +45,23 @@ def main() -> None:
     _strip_proxy_env_overrides()
     parser = argparse.ArgumentParser(description=f"{__app_name__} Desktop Controller")
     parser.add_argument(
+        "--init-data",
+        action="store_true",
+        help="Initialize editable data JSON files and exit cleanly.",
+    )
+    parser.add_argument(
         "--headless",
         action="store_true",
         help="Start local server only (for automated API verification).",
     )
     parser.add_argument("--port", type=int, default=0, help="Port to bind local server on.")
     args, _ = parser.parse_known_args()
+
+    if args.init_data:
+        from sentinelgate.core.storage import StorageManager
+
+        StorageManager()
+        return
 
     port = args.port or _find_free_port()
     app, token = create_app()
