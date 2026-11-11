@@ -1,8 +1,24 @@
 # SentinelGate AI — Zero-Token Cloudflare Worker Relay Setup Guide
 
-Deploying the Cloudflare Worker relay is the **only way to guarantee that `ACCOUNT_ID` and `API_TOKEN` never exist anywhere on end-user computers** — not on disk, not inside `SentinelGateAI.exe`, not inside `sg_seal.dll`, and not in process memory.
+The Worker is the server-side boundary between SentinelGate AI and Cloudflare Gateway. The desktop app sends authenticated requests to the Worker; the Worker uses its Cloudflare credentials to read or update Gateway. `CF_ACCOUNT_ID` and `CF_API_TOKEN` stay in Cloudflare Worker Secrets and are never placed in the desktop app or installer.
 
-The desktop app stores the Worker URL (`WORKER_URL`) and app-to-Worker shared key (`RELAY_CLIENT_SECRET`) in its per-user Windows DPAPI vault. Both can be edited in **API Vault & Security** without rebuilding the app. The Cloudflare API token is configured only as a Cloudflare Worker Secret.
+The desktop app stores the Worker URL (`WORKER_URL`) and app-to-Worker shared key (`RELAY_CLIENT_SECRET`) in its per-user Windows DPAPI vault. Both can be edited in **API Vault & Security** without rebuilding the app. The relay key is distinct from the Cloudflare API token: it authenticates the app to the Worker, while the Cloudflare token authorizes the Worker to access Gateway.
+
+## Request Flow
+
+```mermaid
+sequenceDiagram
+  participant App as SentinelGate AI
+  participant Worker as Cloudflare Worker
+  participant Gateway as Cloudflare Gateway API
+  App->>Worker: HTTPS + X-SG-Relay-Key
+  Worker->>Worker: Authenticate and validate route/body
+  Worker->>Gateway: Request with CF_API_TOKEN Worker Secret
+  Gateway-->>Worker: Gateway result
+  Worker-->>App: JSON response
+```
+
+The relay is deliberately narrow. It does not accept arbitrary upstream paths or methods; it forwards only the supported health, list, and rule operations described below.
 
 ---
 
@@ -10,15 +26,29 @@ The desktop app stores the Worker URL (`WORKER_URL`) and app-to-Worker shared ke
 
 Even if an attacker inspects a client computer, the real Cloudflare API credentials live solely inside Cloudflare's encrypted Worker runtime secrets:
 
-1. **Zero Cloudflare keys on client PCs:** `CF_ACCOUNT_ID` and `CF_API_TOKEN` never leave Cloudflare infrastructure.
-2. **Constant-time client auth (`X-SG-Relay-Key`):** Every route rejects missing or wrong relay keys with `401 Unauthorized`.
+1. **Cloudflare API credentials stay server-side:** `CF_ACCOUNT_ID` and `CF_API_TOKEN` are Worker Secrets. The desktop only stores the Worker endpoint and the separate relay client key in its DPAPI-protected vault.
+2. **Client authentication (`X-SG-Relay-Key`):** Every route rejects missing or incorrect relay keys with `401 Unauthorized`; comparisons use a constant-time equality check.
 3. **Server-side Block-Only Policy Firewall (`403 Forbidden`):**
-   - `POST /v1/lists`: permits only `type: "DOMAIN"` (Cloudflare Zero Trust Gateway domain/hostname lists).
-   - `PATCH /v1/lists/:id`: **append-only** (forbids `remove` or overwriting `items`).
-   - `PUT /v1/lists/:id`: accepts only an `append` array and maps it to Cloudflare's append-only `PATCH`. Cloudflare's native list `PUT` replaces a nonempty `items` array, so replacement payloads are never forwarded.
-   - `POST /v1/rules` & `PUT /v1/rules/:id`: enforces `action === "block"` and `enabled === true` (blocks creating `allow` rules or disabling policies).
-   - Every `DELETE` request under `/v1/rules` or `/v1/lists` is rejected with `403`, including encoded paths, primary policies, trailing shards, lists, and list items. The relay never forwards a delete operation to Cloudflare.
-4. **Client transport:** The app uses HTTPS with environment proxy overrides disabled. The Worker URL is user-configurable in the app; the Cloudflare API token remains exclusively in the Worker runtime.
+   - `POST /v1/lists`: permits only `type: "DOMAIN"` lists.
+   - `PATCH /v1/lists/:id`: accepts only an `append` array; `remove` and `items` replacement fields are rejected.
+   - `PUT /v1/lists/:id`: the app-facing append operation. It accepts only an `append` array and maps it to Cloudflare `PATCH`. [Cloudflare documents](https://developers.cloudflare.com/api/resources/zero_trust/subresources/gateway/subresources/lists/methods/update/) that a native list `PUT` with nonempty `items` replaces the existing items, so the relay never forwards replacement payloads.
+   - `POST /v1/rules` & `PUT /v1/rules/:id`: only enabled `block` rules are allowed.
+   - Every `DELETE` request under `/v1/rules` or `/v1/lists` is rejected with `403`, including encoded paths, rules, lists, and list items. The relay never forwards a delete operation to Cloudflare.
+4. **Transport:** The app sends requests over HTTPS with environment proxy overrides disabled. The Worker URL is editable in the app; the Cloudflare API token remains exclusively in Worker Secrets.
+
+### Route summary
+
+| App request | Worker behavior | Cloudflare operation |
+| --- | --- | --- |
+| `GET /v1/health` | Authenticates and checks Gateway | Reads rules and lists |
+| `GET /v1/lists` or `/v1/lists/:id` | Reads list metadata/items | `GET` list endpoint |
+| `POST /v1/lists` | Creates only a domain list | `POST` list endpoint |
+| `PUT /v1/lists/:id` with `{ "append": [...] }` | Validates append-only payload | `PATCH` list endpoint with `append` |
+| `PATCH /v1/lists/:id` with `{ "append": [...] }` | Same append-only behavior, retained for compatibility | `PATCH` list endpoint with `append` |
+| `GET /v1/rules` | Reads rules | `GET` rules endpoint |
+| `POST /v1/rules` | Creates enabled block rules only | `POST` rules endpoint |
+| `PUT /v1/rules/:id` | Updates enabled block rules only | `PUT` rule endpoint |
+| `DELETE /v1/rules/...` or `/v1/lists/...` | Always rejected | No request forwarded |
 
 ---
 
@@ -110,15 +140,15 @@ Invoke-RestMethod -Uri "https://sentinelgate-relay.<your-subdomain>.workers.dev/
 
 ---
 
-## Step 4: Build the Zero-Token Desktop Installer
+## Step 4: Build, Install, and Configure the Desktop App
 
-After deploying the Worker, set `WORKER_URL` and `RELAY_CLIENT_SECRET` in **API Vault & Security** in the app. `.env` is only needed for the Worker setup script; the installer build does not embed or require relay settings.
+`.env` is only needed for the Worker setup script and deployment checks. The installer build does not embed or require relay settings.
 
 ```powershell
 .\.venv\Scripts\python.exe build.py
 ```
 
-`build.py` builds the installer without Worker credentials. Installed users configure or update their Worker URL and relay client key in the app without rebuilding.
+`build.py` builds the installer without Worker credentials. Run the resulting installer, start SentinelGate AI, then open **API Vault & Security** and enter the deployed Worker URL and matching relay client key. These settings are encrypted in the per-user Windows DPAPI vault. Later Worker URL or relay-key changes can be made there without rebuilding.
 
 When users install `SentinelGateAI-Setup.exe`, they configure the Worker URL, relay client key, and optional Gemini keys inside the app UI (stored per-user via Windows DPAPI).
 
