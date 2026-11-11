@@ -19,7 +19,10 @@ from sentinelgate.config.cf_secrets import CloudflareTransportConfig, execute_se
 CF_MAX_LISTS_PER_ACCOUNT = 100
 CF_MAX_LIST_ITEMS_STANDARD = 1000
 CF_MAX_LIST_ITEMS_ENTERPRISE = 5000
-CF_MAX_EXPRESSION_CHARS = 4090  # Safe ceiling under Cloudflare's 4096-byte wirefilter limit
+# Cloudflare currently documents a 140,000-character Gateway expression limit.
+# Keep a margin and measure UTF-8 bytes so non-ASCII expressions cannot slip over it.
+CF_MAX_EXPRESSION_BYTES = 139_000
+CF_MAX_EXPRESSION_CHARS = CF_MAX_EXPRESSION_BYTES  # Backward-compatible telemetry key.
 CF_MAX_DNS_POLICIES = 500
 CF_MAX_HTTP_POLICIES = 500
 CF_LIST_APPEND_BATCH = 500
@@ -155,6 +158,18 @@ class CloudflareReadOnlyClient:
                 msg = msg.replace(secret_val, replacement)
         return msg
 
+    def _api_error_detail(self, res: Any) -> str:
+        try:
+            body = res.json()
+        except (ValueError, TypeError):
+            body = {}
+        errors = body.get("errors") or [] if isinstance(body, dict) else []
+        messages = [str(error.get("message", "")) for error in errors if isinstance(error, dict)]
+        detail = "; ".join(message for message in messages if message)
+        if not detail:
+            detail = str(body.get("error") or res.text or "No error details returned.") if isinstance(body, dict) else str(res.text or "No error details returned.")
+        return self._redact(f"HTTP {res.status_code}: {detail[:240]}")
+
     def _get_paginated(self, base_url: str, timeout: float = 15.0) -> list[dict[str, Any]]:
         """Fetch all pages of a Cloudflare Gateway collection safely (handles result_info pagination)."""
         if not self.is_configured():
@@ -164,13 +179,22 @@ class CloudflareReadOnlyClient:
         while page <= 20:
             res = self._http_get(base_url, params={"page": page, "per_page": 100}, timeout=timeout)
             if res.status_code != 200:
-                break
-            body = res.json()
+                raise RuntimeError(f"Cloudflare collection read failed: {self._api_error_detail(res)}")
+            try:
+                body = res.json()
+            except (ValueError, TypeError) as exc:
+                raise RuntimeError("Cloudflare returned invalid JSON for a collection read.") from exc
+            if not isinstance(body, dict) or body.get("success") is False:
+                raise RuntimeError(f"Cloudflare collection read failed: {self._api_error_detail(res)}")
             chunk = body.get("result") or []
             if isinstance(chunk, list):
                 items.extend(chunk)
             info = body.get("result_info") or {}
-            total_pages = int(info.get("total_pages") or 1)
+            total_pages = info.get("total_pages")
+            if total_pages is None and info.get("total_count") is not None:
+                per_page = max(1, int(info.get("per_page") or 100))
+                total_pages = (int(info["total_count"]) + per_page - 1) // per_page
+            total_pages = int(total_pages or (page if len(chunk) < 100 else page + 1))
             if page >= total_pages or not chunk:
                 break
             page += 1
@@ -224,9 +248,12 @@ class CloudflareReadOnlyClient:
             return set()
         res = self._http_get(f"{self.lists_url}/{list_id}", timeout=15)
         if res.status_code == 200:
-            items = (res.json().get("result") or {}).get("items") or []
+            body = res.json()
+            if not isinstance(body, dict) or body.get("success") is False:
+                raise RuntimeError(f"Cloudflare list read failed: {self._api_error_detail(res)}")
+            items = (body.get("result") or {}).get("items") or []
             return set(item["value"] for item in items if "value" in item)
-        return set()
+        raise RuntimeError(f"Cloudflare list read failed: {self._api_error_detail(res)}")
 
     def is_block_policy_active(self) -> bool:
         rules = self.get_rules()
@@ -266,6 +293,7 @@ class CloudflareReadOnlyClient:
                 "http_policies_limit": CF_MAX_HTTP_POLICIES,
                 "per_list_item_limit": CF_MAX_LIST_ITEMS_STANDARD,
                 "expression_char_limit": CF_MAX_EXPRESSION_CHARS,
+                "expression_byte_limit": CF_MAX_EXPRESSION_BYTES,
                 "warnings": [],
             }
 
@@ -305,6 +333,7 @@ class CloudflareReadOnlyClient:
             "http_policies_limit": CF_MAX_HTTP_POLICIES,
             "per_list_item_limit": item_limit,
             "expression_char_limit": CF_MAX_EXPRESSION_CHARS,
+            "expression_byte_limit": CF_MAX_EXPRESSION_BYTES,
             "warnings": warnings,
         }
 
@@ -328,7 +357,7 @@ class CloudflareReadOnlyClient:
                     "name": r.get("name"),
                     "enabled": bool(r.get("enabled", False)),
                     "action": r.get("action"),
-                    "traffic_length": len(r.get("traffic") or ""),
+                    "traffic_length": len((r.get("traffic") or "").encode("utf-8")),
                 }
                 for r in rules
                 if (r.get("name") or "").startswith("automated_block")
@@ -339,7 +368,7 @@ class CloudflareReadOnlyClient:
                     "name": r.get("name"),
                     "enabled": bool(r.get("enabled", False)),
                     "action": r.get("action"),
-                    "traffic_length": len(r.get("traffic") or ""),
+                    "traffic_length": len((r.get("traffic") or "").encode("utf-8")),
                 }
                 for r in rules
                 if (r.get("name") or "").startswith("automated_http_search_block")
@@ -370,7 +399,7 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
     Security & Quota Invariants:
     - Only creates/syncs 'block' policies (never 'allow').
     - Automatically shards lists across _p2/_p3 when exceeding per-list limits (1000/5000).
-    - Automatically splits DNS & Search rules across 4090-char policy boundaries atomically.
+    - Splits DNS & Search rules within Cloudflare's current Gateway expression limit.
     """
 
     def _http_write(self, method: str, url: str, json_body: Any = None, timeout: float = 20.0) -> Any:
@@ -391,19 +420,46 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
         return (int(m.group(1)) if m else 0, name)
 
     def create_block_list(self, name: str, current_list_count: int | None = None) -> str | None:
+        self._last_list_create_error = ""
         if not self.is_configured():
+            self._last_list_create_error = "Cloudflare engine is offline."
             return None
         count_now = current_list_count if current_list_count is not None else len(self.get_lists())
         if count_now >= CF_MAX_LISTS_PER_ACCOUNT:
+            self._last_list_create_error = f"Cloudflare account list limit ({CF_MAX_LISTS_PER_ACCOUNT}) reached."
             return None
         payload = {
             "name": name,
-            "type": "HOSTNAME",
+            # Zero Trust Gateway lists use DOMAIN (HOSTNAME belongs to the
+            # separate account-level Rules Lists API).
+            "type": "DOMAIN",
             "description": "Auto-generated blocklist by SentinelGate AI Pentester",
         }
-        res = self._http_write("POST", self.lists_url, json_body=payload, timeout=15)
-        if res.status_code == 200 and res.json().get("success"):
-            return res.json()["result"]["id"]
+        try:
+            res = self._http_write("POST", self.lists_url, json_body=payload, timeout=15)
+        except Exception as exc:
+            self._last_list_create_error = self._redact(f"Request failed: {exc}")[:240]
+            return None
+        try:
+            response_body = res.json()
+            body = response_body if isinstance(response_body, dict) else {}
+        except (ValueError, TypeError):
+            body = {}
+        if res.status_code in (200, 201) and body.get("success"):
+            list_id = (body.get("result") or {}).get("id")
+            if list_id:
+                return list_id
+            self._last_list_create_error = "Cloudflare returned success without a list ID."
+            return None
+        if res.status_code in (200, 201) and body.get("id"):
+            # Some compatible relays return the result object directly.
+            return body["id"]
+        errors = body.get("errors") or []
+        messages = [str(error.get("message", "")) for error in errors if isinstance(error, dict)]
+        detail = "; ".join(message for message in messages if message)
+        if not detail:
+            detail = str(body.get("error") or res.text or "No error details returned.")
+        self._last_list_create_error = self._redact(f"HTTP {res.status_code}: {detail[:240]}")
         return None
 
     def append_domains_to_list(
@@ -503,10 +559,12 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
             if not new_id:
                 quota_hit = True
                 if log_cb:
-                    log_cb(f"  [X] Unable to create list '{new_name}' (account list quota may be full).")
+                    detail = getattr(self, "_last_list_create_error", "")
+                    suffix = f" {detail}" if detail else ""
+                    log_cb(f"  [X] Unable to create list '{new_name}'.{suffix}")
                 break
 
-            summaries[new_name] = {"id": new_id, "count": 0, "type": "HOSTNAME"}
+            summaries[new_name] = {"id": new_id, "count": 0, "type": "DOMAIN"}
             shard_names.append(new_name)
 
             to_push = remaining[:item_cap]
@@ -551,11 +609,15 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
         cf_lists: dict[str, str],
         log_cb: Callable[[str], None] | None = None,
     ) -> bool:
-        """Sync automated_block* DNS policies across sharded lists & 4090-char wirefilter limits atomically."""
+        """Sync automated_block* DNS policies within Gateway expression limits atomically."""
         rules = self.get_rules()
         base_name = "automated_block"
         existing_dns_rules = sorted(
-            [r for r in rules if (r.get("name") or "").startswith(base_name)],
+            [
+                r for r in rules
+                if (r.get("name") or "") == base_name
+                or re.fullmatch(r"automated_block_p\d+", r.get("name") or "")
+            ],
             key=self._rule_sort_key,
         )
 
@@ -582,13 +644,13 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
                 log_cb("  [!] No Cloudflare block lists found to bind to automated_block.")
             return False
 
-        # Pack `any(dns.domains[*] in $uuid)` expressions within 4090 chars per DNS policy
+        # Pack expressions within the documented Gateway policy expression limit.
         policy_traffics: list[str] = []
         curr_parts: list[str] = []
         for cf_id in list_ids_for_block:
             cond = f"any(dns.domains[*] in ${cf_id})"
             candidate = " or ".join(curr_parts + [cond])
-            if len(candidate) > CF_MAX_EXPRESSION_CHARS and curr_parts:
+            if len(candidate.encode("utf-8")) > CF_MAX_EXPRESSION_BYTES and curr_parts:
                 policy_traffics.append(" or ".join(curr_parts))
                 curr_parts = [cond]
             else:
@@ -618,17 +680,22 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
                 "action": "block",
                 "traffic": desired_traffic,
                 "enabled": True,
-                "rule_settings": {"block_page_enabled": True},
-                "precedence": idx,
+                "filters": ["dns"],
+                "block_page_enabled": True,
             }
 
             target_rule = existing_dns_rules.pop(0) if existing_dns_rules else None
+            if target_rule and isinstance(target_rule.get("precedence"), int):
+                # Gateway precedence values are account-wide. Preserve the current slot
+                # when updating; let Cloudflare append newly-created chunks safely.
+                payload["precedence"] = target_rule["precedence"]
             if (
                 target_rule
                 and target_rule.get("traffic") == desired_traffic
                 and target_rule.get("name") == policy_name
                 and target_rule.get("action") == "block"
                 and target_rule.get("enabled") is True
+                and "dns" in (target_rule.get("filters") or ["dns"])
             ):
                 active_ids.append(target_rule["id"])
                 continue
@@ -649,7 +716,13 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
         if not errors and len(active_ids) == total_parts and existing_dns_rules:
             for leftover in existing_dns_rules:
                 if leftover.get("id") not in active_ids:
-                    self._http_write("DELETE", f"{self.rules_url}/{leftover['id']}", timeout=15)
+                    try:
+                        del_res = self._http_write("DELETE", f"{self.rules_url}/{leftover['id']}", timeout=15)
+                        if del_res.status_code != 200 and log_cb:
+                            log_cb(self._redact(f"  [!] New DNS policy is live, but old chunk cleanup failed: HTTP {del_res.status_code} {del_res.text[:160]}"))
+                    except Exception as exc:
+                        if log_cb:
+                            log_cb(self._redact(f"  [!] New DNS policy is live, but old chunk cleanup failed: {exc}"))
 
         ok = len(errors) == 0 and len(active_ids) == total_parts
         if log_cb:
@@ -675,6 +748,15 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
         """
         if not traffic_chunks:
             return {"ok": False, "error": "No regex chunks generated.", "sync_phase": "failed"}
+        oversized = [
+            idx for idx, traffic in enumerate(traffic_chunks, start=1)
+            if len(traffic.encode("utf-8")) > CF_MAX_EXPRESSION_BYTES
+        ]
+        if oversized:
+            msg = f"Search expression chunk(s) {oversized[:8]} exceed the {CF_MAX_EXPRESSION_BYTES}-byte Gateway limit."
+            if log_cb:
+                log_cb(f"[X] {msg}")
+            return {"ok": False, "error": msg, "sync_phase": "failed", "errors": [msg]}
 
         def emit_phase(phase: str, detail: str, **extra: Any) -> None:
             if phase_cb:
@@ -687,7 +769,11 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
         rules = self.get_rules()
         base_name = "automated_http_search_block"
         existing_action_rules = sorted(
-            [r for r in rules if (r.get("name") or "").startswith(base_name)],
+            [
+                r for r in rules
+                if (r.get("name") or "") == base_name
+                or re.fullmatch(r"automated_http_search_block_p\d+", r.get("name") or "")
+            ],
             key=self._rule_sort_key,
         )
         non_managed_http = len([
@@ -739,6 +825,12 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
             }
 
             target_rule = existing_action_rules.pop(0) if existing_action_rules else None
+            if target_rule and isinstance(target_rule.get("precedence"), int):
+                payload["precedence"] = target_rule["precedence"]
+            if target_rule and target_rule.get("block_page"):
+                # A PUT replaces the rule object. Keep a policy-specific redirect
+                # configured in Gateway when changing only the managed expression.
+                payload["block_page"] = target_rule["block_page"]
 
             if (
                 target_rule
@@ -746,6 +838,7 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
                 and target_rule.get("name") == policy_name
                 and target_rule.get("action") == "block"
                 and target_rule.get("enabled") is True
+                and "http" in (target_rule.get("filters") or ["http"])
             ):
                 active_rule_ids.append(target_rule["id"])
                 unchanged_count += 1
@@ -760,12 +853,12 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
             action_word = "Updating in-place" if target_rule else "Creating new"
             emit_phase(
                 "pushing_in_place",
-                f"{action_word} rule {part_index}/{total_chunks} ({len(traffic)}/{CF_MAX_EXPRESSION_CHARS} chars)...",
+                f"{action_word} rule {part_index}/{total_chunks} ({len(traffic.encode('utf-8'))}/{CF_MAX_EXPRESSION_BYTES} bytes)...",
                 pushed=part_index - 1,
                 total=total_chunks,
             )
             if log_cb:
-                log_cb(f"  -> {action_word} {policy_name} ({part_index}/{total_chunks}, {len(traffic)}/{CF_MAX_EXPRESSION_CHARS} chars)...")
+                log_cb(f"  -> {action_word} {policy_name} ({part_index}/{total_chunks}, {len(traffic.encode('utf-8'))}/{CF_MAX_EXPRESSION_BYTES} bytes)...")
 
             try:
                 if target_rule:
@@ -825,6 +918,8 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
                         del_res = self._http_write("DELETE", f"{self.rules_url}/{leftover_rule['id']}", timeout=15)
                         if del_res.status_code == 200:
                             cleaned_obsolete += 1
+                        elif log_cb:
+                            log_cb(self._redact(f"  [!] Failed trimming {leftover_rule.get('name')}: HTTP {del_res.status_code} {del_res.text[:160]}"))
                         emit_phase(
                             "trimming_trailing",
                             f"Trimmed obsolete rule {idx_del}/{len(leftovers)}",

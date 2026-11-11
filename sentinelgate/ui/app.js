@@ -140,13 +140,13 @@ async function refreshOverview() {
       const dnsRules = cf.dns_rules || [];
       if (dnsRules.length > 0) {
         for (const dr of dnsRules) {
-          items.push(`<div class="mini-row"><span><code>${escapeHtml(dr.name)}</code> (DNS ${dr.traffic_length}/4090 chars)</span><span class="badge ${dr.enabled ? "badge-ok" : "badge-warn"}">${dr.enabled ? "ENABLED" : "DISABLED"}</span></div>`);
+          items.push(`<div class="mini-row"><span><code>${escapeHtml(dr.name)}</code> (DNS ${dr.traffic_length}/139000 bytes)</span><span class="badge ${dr.enabled ? "badge-ok" : "badge-warn"}">${dr.enabled ? "ENABLED" : "DISABLED"}</span></div>`);
         }
       } else {
         items.push(`<div class="mini-row"><span><code>automated_block</code> (DNS)</span><span class="badge ${cf.dns_rule_active ? "badge-ok" : "badge-warn"}">${cf.dns_rule_active ? "ENABLED" : "NOT ACTIVE"}</span></div>`);
       }
       for (const sr of searchRules) {
-        items.push(`<div class="mini-row"><span><code>${escapeHtml(sr.name)}</code> (${sr.traffic_length}/4090 chars)</span><span class="badge ${sr.enabled ? "badge-ok" : "badge-warn"}">${escapeHtml(sr.action).toUpperCase()}</span></div>`);
+        items.push(`<div class="mini-row"><span><code>${escapeHtml(sr.name)}</code> (${sr.traffic_length}/139000 bytes)</span><span class="badge ${sr.enabled ? "badge-ok" : "badge-warn"}">${escapeHtml(sr.action).toUpperCase()}</span></div>`);
       }
       if (searchRules.length === 0) {
         items.push(`<div class="muted">No automated_http_search_block rules deployed yet.</div>`);
@@ -158,7 +158,7 @@ async function refreshOverview() {
     document.getElementById("q-lists").textContent = `${q.lists_used ?? "--"} / ${q.lists_limit ?? 100}`;
     document.getElementById("q-dns-pol").textContent = `${q.dns_policies_used ?? "--"} / ${q.dns_policies_limit ?? 500}`;
     document.getElementById("q-http-pol").textContent = `${q.http_policies_used ?? "--"} / ${q.http_policies_limit ?? 500}`;
-    document.getElementById("q-item-cap").textContent = `${q.per_list_item_limit ?? 1000} items • ${q.expression_char_limit ?? 4090} chars`;
+    document.getElementById("q-item-cap").textContent = `${q.per_list_item_limit ?? 1000} items • ${q.expression_byte_limit ?? 139000} bytes`;
     const warns = q.warnings || [];
     setFeedback("cf-quota-warnings", warns.length ? `Quota Alert: ${warns.join(" | ")}` : "All Cloudflare Gateway limits healthy.", warns.length === 0);
 
@@ -370,10 +370,10 @@ async function loadSearchChunks() {
   const box = document.getElementById("chunks-preview-box");
   box.classList.remove("hidden");
   box.innerHTML = `
-    <div><strong>Dynamic Chunk Packing:</strong> ${res.total_terms} unique base terms condensed into <strong>${res.chunk_count}</strong> Cloudflare HTTP rules (max 4090 chars &amp; 512KB Rust DFA).</div>
+    <div><strong>Dynamic Chunk Packing:</strong> ${res.total_terms} unique base terms condensed into <strong>${res.chunk_count}</strong> Cloudflare HTTP rules (max 139,000 expression bytes and local DFA capacity).</div>
     ${res.chunks.map((ch) => `
       <div class="mini-row">
-        <span>Part ${ch.part}: <strong>${ch.term_count}</strong> terms (${ch.traffic_length}/4090 chars)</span>
+        <span>Part ${ch.part}: <strong>${ch.term_count}</strong> terms (${ch.traffic_length}/139000 bytes)</span>
         <span class="muted">${escapeHtml(ch.sample_terms.join(", "))}...</span>
       </div>
     `).join("")}
@@ -397,7 +397,7 @@ async function previewRegexInspector() {
     box.classList.remove("hidden");
     box.innerHTML = `
       <div class="btn-row">
-        <span class="badge ${d.within_char_limit ? "badge-ok" : "badge-err"}">Traffic Length: ${d.traffic_length} / ${d.max_traffic_length}</span>
+        <span class="badge ${d.within_byte_limit ? "badge-ok" : "badge-err"}">Traffic Size: ${d.traffic_length} / ${d.max_traffic_length} bytes</span>
         <span class="badge ${d.rust_dfa_ok ? "badge-ok" : "badge-err"}">Rust 512KB DFA: ${d.rust_dfa_ok === null ? "N/A" : d.rust_dfa_ok ? "PASS" : "EXCEEDED"}</span>
         <span class="badge ${d.python_re_ok ? "badge-ok" : "badge-err"}">RE2 Syntax: ${d.python_re_ok ? "VALID" : "ERROR"}</span>
         ${matchBadge}
@@ -542,8 +542,9 @@ async function runUptesterBlockAudit() {
         <span class="badge badge-lock">Policy Modified: FALSE (Read-Only)</span>
         <span class="badge badge-ok">Enforced: ${r.enforced || 0}/${r.checked || 0}</span>
         <span class="badge ${slips.length ? "badge-err" : "badge-ok"}">Slip-Throughs Found: ${slips.length}</span>
+        ${r.indeterminate_count ? `<span class="badge badge-warn">Unconfirmed probes: ${r.indeterminate_count}</span>` : ""}
       </div>
-      ${slips.length ? `<div class="mini-list" style="margin-top:10px">${slips.map((s) => `<div class="mini-row"><span>[${escapeHtml(s.kind).toUpperCase()}] <code>${escapeHtml(s.item)}</code> (${escapeHtml(s.category)})</span><button class="btn btn-sm btn-warning" onclick="switchView('${s.kind === "dns" ? "dns" : "search"}')">Escalate to Pentester</button></div>`).join("")}</div>` : '<p class="muted" style="margin-top:8px">All audited critical slip-through targets are actively blocked.</p>'}
+      ${slips.length ? `<div class="mini-list" style="margin-top:10px">${slips.map((s) => `<div class="mini-row"><span>[${escapeHtml(s.kind).toUpperCase()}] <code>${escapeHtml(s.item)}</code> (${escapeHtml(s.category)})</span><button class="btn btn-sm btn-warning" onclick="switchView('${s.kind === "dns" ? "dns" : "search"}')">Escalate to Pentester</button></div>`).join("")}</div>` : r.indeterminate_count ? `<p class="muted" style="margin-top:8px">No bypass was confirmed. ${r.indeterminate_count} probe(s) need a retry because the result was inconclusive.</p>` : '<p class="muted" style="margin-top:8px">All audited critical slip-through targets are actively blocked.</p>'}
     `;
   });
 }
@@ -880,11 +881,11 @@ function renderReportDetail(rep) {
       </div>
       <div class="mini-row">
         <span><strong>Stage 3B (Essential Searches Not Supposed To Be Blocked)</strong></span>
-        <span class="badge ${overSearch.length ? "badge-warn" : "badge-ok"}">${s3.search_healthy || 0}/${s3.search_tested || 0} Allowed (${overSearch.length} Over-Blocked)</span>
+        <span class="badge ${overSearch.length || s3.search_indeterminate_count ? "badge-warn" : "badge-ok"}">${s3.search_healthy || 0}/${s3.search_tested || 0} Allowed (${overSearch.length} Over-Blocked${s3.search_indeterminate_count ? `, ${s3.search_indeterminate_count} Unconfirmed` : ""})</span>
       </div>
       <div class="mini-row">
         <span><strong>Stage 3C (Critical Block Enforcement Audit)</strong></span>
-        <span class="badge ${slips.length ? "badge-err" : "badge-ok"}">${s3.critical_enforced || 0}/${s3.critical_checked || 0} Enforced (${slips.length} Slip-Throughs)</span>
+        <span class="badge ${slips.length ? "badge-err" : s3.critical_indeterminate_count ? "badge-warn" : "badge-ok"}">${s3.critical_enforced || 0}/${s3.critical_checked || 0} Enforced (${slips.length} Slip-Throughs${s3.critical_indeterminate_count ? `, ${s3.critical_indeterminate_count} Unconfirmed` : ""})</span>
       </div>
     </div>
     ${overDns.length ? `<div style="margin-top:10px;"><strong>Over-Blocked Essential Domains (False Positives):</strong><div class="pill-wrap" style="margin-top:4px;">${overDns.map((o) => `<span class="item-pill">${escapeHtml(o.domain)} (${escapeHtml(o.category)})</span>`).join("")}</div></div>` : ""}

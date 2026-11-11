@@ -139,6 +139,7 @@ def local_rust_preflight_silent(raw_regex: str) -> bool | None:
 def validate_regex_detailed(raw_regex: str) -> dict:
     """Return full diagnostic status (char length, DFA validation, Python compile check)."""
     traffic = format_traffic_condition(raw_regex) if raw_regex else ""
+    traffic_bytes = len(traffic.encode("utf-8"))
     bin_ok, bin_info = verify_validator_integrity()
     dfa_ok = local_rust_preflight_silent(raw_regex) if (raw_regex and bin_ok) else None
 
@@ -154,9 +155,11 @@ def validate_regex_detailed(raw_regex: str) -> dict:
     return {
         "raw_regex": raw_regex,
         "traffic_condition": traffic,
-        "traffic_length": len(traffic),
-        "max_traffic_length": 4090,
-        "within_char_limit": len(traffic) <= 4090,
+        "traffic_length": traffic_bytes,
+        "traffic_bytes": traffic_bytes,
+        "max_traffic_length": 139_000,
+        "within_byte_limit": traffic_bytes <= 139_000,
+        "within_char_limit": traffic_bytes <= 139_000,
         "validator_integrity_ok": bin_ok,
         "validator_info": bin_info,
         "rust_dfa_ok": dfa_ok,
@@ -169,9 +172,9 @@ def calculate_dynamic_chunks(
     terms: list[str],
     log_cb: Callable[[str], None] | None = None,
 ) -> list[list[str]]:
-    """Condense base terms into optimal chunks obeying 4090-char and 512KB Rust DFA limits."""
+    """Condense terms within Cloudflare's expression byte limit and Rust DFA limit."""
     if log_cb:
-        log_cb("Calculating optimal dynamic chunks (maxing out Cloudflare 4090-char & 512KB DFA limits)...")
+        log_cb("Calculating dynamic chunks within Cloudflare's 140,000-character rule limit and local DFA capacity...")
 
     chunks: list[list[str]] = []
     current_chunk: list[str] = []
@@ -211,10 +214,10 @@ def calculate_dynamic_chunks(
 
     try:
         for term in terms:
-            # Verify individual term fits inside Cloudflare's 4090-char and 512KB DFA budget
+            # Verify individual term fits within the expression and local DFA budgets.
             single_regex = build_flat_regex([term])
             single_traffic = format_traffic_condition(single_regex)
-            if len(single_traffic) > 4090 or (has_rust and not _check_dfa(single_regex)):
+            if len(single_traffic.encode("utf-8")) > 139_000 or (has_rust and not _check_dfa(single_regex)):
                 if log_cb:
                     log_cb(f"  [!] Skipping oversized term '{term}' (exceeds single-rule Cloudflare limit).")
                 continue
@@ -223,8 +226,8 @@ def calculate_dynamic_chunks(
             test_regex = build_flat_regex(current_chunk)
             test_traffic = format_traffic_condition(test_regex)
 
-            # 1. Cloudflare has a hard 4096 character limit for the traffic expression string
-            is_valid_len = len(test_traffic) <= 4090
+            # Cloudflare documents a 140,000-character limit; reserve margin in UTF-8 bytes.
+            is_valid_len = len(test_traffic.encode("utf-8")) <= 139_000
 
             # 2. Rust DFA memory limits (512KB computational limit check)
             is_valid_dfa = _check_dfa(test_regex) if is_valid_len else False

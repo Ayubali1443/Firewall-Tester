@@ -80,6 +80,7 @@ class UptesterService:
         checked = 0
         enforced = 0
         slip_throughs: list[dict[str, str]] = []
+        indeterminate = 0
 
         if log_cb:
             log_cb(f"[READ-ONLY] Auditing {len(dns_items)} critical domains & {len(search_items)} search vectors...")
@@ -115,10 +116,14 @@ class UptesterService:
                 enforced += 1
                 if log_cb:
                     log_cb(f"  [ENFORCED] Search '{term}' ({label})")
-            else:
+            elif label == "BYPASSED":
                 slip_throughs.append({"kind": "search", "category": cat, "item": term})
                 if log_cb:
                     log_cb(f"  [SLIP-THROUGH] Search '{term}' BYPASSED — escalate to Pentester!")
+            else:
+                indeterminate += 1
+                if log_cb:
+                    log_cb(f"  [INDETERMINATE] Search '{term}' could not be classified; retry when connectivity is stable.")
             if progress_cb:
                 progress_cb({"current": checked, "total": total, "item": term})
             time.sleep(0.8)
@@ -132,6 +137,7 @@ class UptesterService:
             "policy_modified": False,
             "checked": checked,
             "enforced": enforced,
+            "indeterminate_count": indeterminate,
             "slip_through_count": len(slip_throughs),
             "slip_throughs": slip_throughs,
         }
@@ -241,19 +247,26 @@ class UptesterService:
         total = len(items)
         healthy = 0
         blocked_queries: list[dict[str, str]] = []
+        indeterminate_queries: list[dict[str, str]] = []
+        tested = 0
 
         for idx, (cat, term) in enumerate(items, start=1):
             if stop_event and stop_event.is_set():
                 break
+            tested += 1
             blocked, label = is_search_term_blocked(term)
-            if not blocked:
+            if label == "BYPASSED" and not blocked:
                 healthy += 1
                 if log_cb:
                     log_cb(f"  [OK] '{term}' allowed.")
-            else:
+            elif blocked:
                 blocked_queries.append({"category": cat, "term": term, "status": label})
                 if log_cb:
                     log_cb(f"  [WARN] '{term}' was {label}.")
+            else:
+                indeterminate_queries.append({"category": cat, "term": term, "status": label})
+                if log_cb:
+                    log_cb(f"  [INDETERMINATE] '{term}' probe did not confirm an allow or block result.")
             if progress_cb:
                 progress_cb({"current": idx, "total": total, "item": term})
             if idx < total:
@@ -263,8 +276,10 @@ class UptesterService:
             "ok": True,
             "read_only": True,
             "policy_modified": False,
-            "tested": total,
+            "tested": tested,
             "healthy": healthy,
             "blocked_count": len(blocked_queries),
             "blocked_queries": blocked_queries,
+            "indeterminate_count": len(indeterminate_queries),
+            "indeterminate_queries": indeterminate_queries,
         }

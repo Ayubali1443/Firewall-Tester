@@ -135,8 +135,86 @@
             "pimpandhost",
             "imagebam",
             "rule34",
-            "gelbooru"
+            "gelbooru",
+            "pexels",
+            "pixabay"
         ],
-        "history": []
+        "history": [
+            "pexels",
+            "pixabay"
+        ]
+    },
+    "EncyclopediaTimeWastersTerms+block": {
+        "category": "EncyclopediaTimeWastersTerms",
+        "action": "block",
+        "ai_target": false,
+        "scope": "productivity_loss",
+        "description": "Search terms related to entertainment wikis, pop culture encyclopedias, meme databases, satirical reference sites, and general encyclopedias like Wikipedia known for deep rabbit-holes that reduce productivity.",
+        "terms": [
+            "wikipedia",
+            "tv tropes",
+            "fandom wiki",
+            "wikia",
+            "know your meme",
+            "urban dictionary",
+            "uncyclopedia",
+            "wikidot",
+            "fextralife",
+            "ign wikis",
+            "bulbapedia",
+            "encyclopedia dramatica"
+        ],
+        "history": [
+            "wikipedia",
+            "tv tropes",
+            "fandom wiki",
+            "wikia",
+            "know your meme",
+            "urban dictionary",
+            "uncyclopedia",
+            "wikidot",
+            "fextralife",
+            "ign wikis",
+            "bulbapedia",
+            "encyclopedia dramatica"
+        ]
+    },
+    "AlternativeBrowsersTerms+block": {
+        "category": "AlternativeBrowsersTerms",
+        "action": "block",
+        "ai_target": false,
+        "scope": "software_restriction",
+        "description": "Search terms related to downloading or accessing alternative web browsers.",
+        "terms": [
+            "browser",
+            "download browsers",
+            "download chrome",
+            "download firefox",
+            "brave browser download",
+            "opera gx",
+            "librewolf download",
+            "waterfox",
+            "thorium browser",
+            "epic privacy browser",
+            "download edge",
+            "ungoogled chromium"
+        ],
+        "history": [
+            "browser",
+            "download browsers",
+            "download chrome",
+            "download firefox",
+            "brave browser download",
+            "opera gx",
+            "tor browser",
+            "vivaldi browser",
+            "arc browser download",
+            "librewolf download",
+            "waterfox",
+            "thorium browser",
+            "epic privacy browser",
+            "download edge",
+            "ungoogled chromium"
+        ]
     }
 }

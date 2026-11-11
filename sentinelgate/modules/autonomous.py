@@ -561,8 +561,10 @@ class AutonomousRunner:
                     "search_healthy": search_up_res.get("healthy", 0),
                     "search_overblocked_count": search_up_res.get("blocked_count", 0),
                     "search_overblocked": search_up_res.get("blocked_queries", []),
+                    "search_indeterminate_count": search_up_res.get("indeterminate_count", 0),
                     "critical_checked": block_audit_res.get("checked", 0),
                     "critical_enforced": block_audit_res.get("enforced", 0),
+                    "critical_indeterminate_count": block_audit_res.get("indeterminate_count", 0),
                     "critical_slip_through_count": block_audit_res.get("slip_through_count", 0),
                     "critical_slip_throughs": block_audit_res.get("slip_throughs", []),
                 }

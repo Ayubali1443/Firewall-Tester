@@ -81,7 +81,7 @@ class SentinelGateCoreTests(unittest.TestCase):
         self.assertGreaterEqual(len(chunks), 1)
         for ch in chunks:
             traffic = format_traffic_condition(build_flat_regex(ch))
-            self.assertLessEqual(len(traffic), 4090)
+            self.assertLessEqual(len(traffic.encode("utf-8")), 139000)
 
     def test_skeleton_cleaner_and_virtual_pentest(self) -> None:
         self.assertEqual(get_skeleton("p0rn"), get_skeleton("porn"))
@@ -748,7 +748,7 @@ class SentinelGateCoreTests(unittest.TestCase):
         self.assertEqual([r["id"] for r in all_rules], ["r1", "r2"])
 
         # 3. Adaptive list sharding fills capacity up to 1000 and spills into _p2
-        summaries = {"Proxies+block": {"id": "uuid-1", "count": 998, "type": "HOSTNAME"}}
+        summaries = {"Proxies+block": {"id": "uuid-1", "count": 998, "type": "DOMAIN"}}
         patched_batches = []
         created_names = []
 
@@ -773,7 +773,7 @@ class SentinelGateCoreTests(unittest.TestCase):
         self.assertEqual(patched_batches[0], ("uuid-1", ["a.com", "b.com"]))
         self.assertEqual(patched_batches[1], ("uuid-2", ["c.com", "d.com"]))
 
-        # 4. DNS policy expression splits across multiple 4090-char policies when >65 lists exist
+        # 4. DNS policy expression packs within Cloudflare's current 140,000-character limit
         many_lists = {f"Proxies+block_p{i}": f"00000000-0000-0000-0000-{i:012d}" for i in range(1, 76)}
         dns_data = {"Proxies+block": {"action": "block", "domains": []}}
         posted_dns = []
@@ -786,12 +786,12 @@ class SentinelGateCoreTests(unittest.TestCase):
              mock.patch.object(writer._session, "post", side_effect=fake_dns_post):
             synced = writer.sync_dns_block_policy(dns_data, many_lists)
         self.assertTrue(synced)
-        self.assertEqual(len(posted_dns), 2)
-        self.assertEqual([p["name"] for p in posted_dns], ["automated_block_p1", "automated_block_p2"])
-        self.assertTrue(all(len(p["traffic"]) <= 4090 for p in posted_dns))
+        self.assertEqual(len(posted_dns), 1)
+        self.assertEqual([p["name"] for p in posted_dns], ["automated_block"])
+        self.assertTrue(all(len(p["traffic"].encode("utf-8")) <= 139000 for p in posted_dns))
 
         # 5. Quota telemetry raises warnings when near account caps
-        near_lists = {f"L{i}": {"id": f"id-{i}", "count": 950, "type": "HOSTNAME"} for i in range(88)}
+        near_lists = {f"L{i}": {"id": f"id-{i}", "count": 950, "type": "DOMAIN"} for i in range(88)}
         q = writer.get_quota_telemetry(rules=[], list_summaries=near_lists)
         self.assertEqual(q["lists_used"], 88)
         self.assertEqual(q["lists_limit"], 100)

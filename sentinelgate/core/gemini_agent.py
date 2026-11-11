@@ -240,7 +240,7 @@ def build_search_slipthrough_prompt(
         f"CATEGORY FOCUS: {description or 'Slip-through base search terms.'}\n"
         f"CURRENT ACTIVE BLOCKLIST SAMPLE:\n{', '.join(sample_active)}\n"
         f"{history_context}\n"
-        "TASK: Suggest up to 20 concise, high-signal base search keywords/phrases (1 to 3 words each, clean lowercase canonical forms that real users actually search).\n"
+        "TASK: Suggest up to 10 concise, high-signal base search keywords/phrases (1 to 3 words each, clean lowercase canonical forms that real users actually search).\n"
         "STRICT QUALITY RULE: Quality matters far more than quantity. NEVER pad with contrived 5+ word sentences, generic single words ('free', 'online', 'fast', 'unblock'), or minor variants just to add items. "
         "If no genuinely useful, non-redundant keywords remain for this category, return ONLY the exact word NONE.\n"
         "CRITICAL: Return ONLY a comma-separated list of concise terms, OR NONE. No markdown, no numbers, no explanations.\n"

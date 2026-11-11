@@ -689,7 +689,7 @@ fn validate_body_policy(method: &str, path: &str, body: &str) -> bool {{
         return has_block && !has_bad_action && has_enabled && !has_disabled;
     }}
     if method == "POST" && path_base == "/lists" {{
-        return kvs.iter().any(|(k, v)| k == "type" && v.eq_ignore_ascii_case("HOSTNAME"));
+        return kvs.iter().any(|(k, v)| k == "type" && v.eq_ignore_ascii_case("DOMAIN"));
     }}
     if method == "PATCH" && path_base.starts_with("/lists/") {{
         let has_append = kvs.iter().any(|(k, _)| k == "append");
@@ -787,7 +787,7 @@ fn exec_http_raw(method: &str, rel_path: &str, body_bytes: &[u8]) -> Result<(i32
     let mut s0 = unseal_vec(0).ok_or(-5)?;
     let mut s1 = unseal_vec(1).ok_or(-5)?;
 
-    let (mut host_owned, port, mut full_path, mut auth_hdr) = if SEAL_MODE == 2 {{
+    let (host_owned, port, full_path, auth_hdr) = if SEAL_MODE == 2 {{
         let endpoint = String::from_utf8_lossy(&s0).into_owned();
         let secret = String::from_utf8_lossy(&s1).into_owned();
         let (h_owned, p_num, prefix_owned) = {{

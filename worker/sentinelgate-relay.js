@@ -102,8 +102,8 @@ export default {
       const parsed = await readJsonSafe(request);
       if (!parsed.ok) return jsonResp({ success: false, error: "Invalid JSON payload." }, 400);
       const body = parsed.body;
-      if (body?.type !== "HOSTNAME") {
-        return jsonResp({ success: false, error: "Only HOSTNAME lists are permitted." }, 403);
+      if (body?.type !== "DOMAIN") {
+        return jsonResp({ success: false, error: "Only DOMAIN lists are permitted." }, 403);
       }
       return cfFetch(env, "/lists", { method: "POST", body: JSON.stringify(body) });
     }
