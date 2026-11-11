@@ -16,7 +16,7 @@ Security Architecture:
   - Native WinHTTP bypasses user/system proxies and verifies server cert Issuer/Subject
     before sending any secret headers (blocks local Fiddler/mitmproxy/Burp MITM).
   - Native block-only JSON/path policy guard rejects allow-listing, disables, list
-    removals, or non-trailing rule deletions directly inside Rust machine code.
+    removals, or policy/list/item deletions directly inside Rust machine code.
 """
 
 from __future__ import annotations
@@ -588,21 +588,6 @@ fn to_wide_vec(s: &str) -> Vec<u16> {{
     v
 }}
 
-fn is_valid_uuid(s: &str) -> bool {{
-    let b = s.as_bytes();
-    if b.len() != 36 {{
-        return false;
-    }}
-    for (i, ch) in b.iter().enumerate() {{
-        if i == 8 || i == 13 || i == 18 || i == 23 {{
-            if *ch != b'-' {{ return false; }}
-        }} else if !ch.is_ascii_hexdigit() {{
-            return false;
-        }}
-    }}
-    true
-}}
-
 // Extract top-level / simple JSON key values cleanly without matching text inside unrelated string values
 fn json_extract_kv_tokens(json: &str) -> Vec<(String, String)> {{
     let mut pairs = Vec::new();
@@ -689,30 +674,14 @@ fn validate_body_policy(method: &str, path: &str, body: &str) -> bool {{
         return has_block && !has_bad_action && has_enabled && !has_disabled;
     }}
     if method == "POST" && path_base == "/lists" {{
-        return kvs.iter().any(|(k, v)| k == "type" && (v.eq_ignore_ascii_case("HOSTNAME") || v.eq_ignore_ascii_case("DOMAIN")));
+        return kvs.iter().any(|(k, v)| k == "type" && v.eq_ignore_ascii_case("DOMAIN"));
     }}
     if method == "PATCH" && path_base.starts_with("/lists/") {{
         let has_append = kvs.iter().any(|(k, _)| k == "append");
         let has_forbidden = kvs.iter().any(|(k, _)| k == "remove" || k == "items");
         return has_append && !has_forbidden;
     }}
-    method == "GET" || method == "DELETE"
-}}
-
-fn is_trailing_chunk_name(name: &str) -> Option<&'static str> {{
-    for (prefix, base) in [
-        ("automated_http_search_block_p", "automated_http_search_block"),
-        ("automated_block_p", "automated_block"),
-    ] {{
-        if let Some(num_str) = name.strip_prefix(prefix) {{
-            if let Ok(n) = num_str.parse::<u32>() {{
-                if n >= 2 {{
-                    return Some(base);
-                }}
-            }}
-        }}
-    }}
-    None
+    method == "GET"
 }}
 
 #[cfg(windows)]
@@ -915,71 +884,6 @@ fn exec_http_raw(method: &str, rel_path: &str, body_bytes: &[u8]) -> Result<(i32
     }}
 }}
 
-fn check_delete_rule_safe(rel_path: &str) -> bool {{
-    let uuid = match rel_path.strip_prefix("/rules/") {{
-        Some(u) => u.split('?').next().unwrap_or(""),
-        None => return false,
-    }};
-    if !is_valid_uuid(uuid) {{
-        return false;
-    }}
-    #[cfg(windows)]
-    {{
-        let (status, raw) = match exec_http_raw("GET", "/rules?per_page=100", b"") {{
-            Ok(v) => v,
-            Err(_) => return false,
-        }};
-        if status != 200 {{
-            return false;
-        }}
-        let text = String::from_utf8_lossy(&raw);
-        let kvs = json_extract_kv_tokens(&text);
-        // Walk groups per object cleanly by matching id -> name -> action -> enabled
-        let mut target_base: Option<&'static str> = None;
-        let mut rules: Vec<(String, String, String, String)> = Vec::new();
-        let (mut cur_id, mut cur_name, mut cur_act, mut cur_en) = (String::new(), String::new(), String::new(), String::new());
-        for (k, v) in kvs {{
-            if k == "id" && is_valid_uuid(&v) {{
-                if !cur_id.is_empty() {{
-                    rules.push((cur_id.clone(), cur_name.clone(), cur_act.clone(), cur_en.clone()));
-                }}
-                cur_id = v;
-                cur_name.clear();
-                cur_act.clear();
-                cur_en.clear();
-            }} else if k == "name" && cur_name.is_empty() {{
-                cur_name = v;
-            }} else if k == "action" && cur_act.is_empty() {{
-                cur_act = v;
-            }} else if k == "enabled" && cur_en.is_empty() {{
-                cur_en = v;
-            }}
-        }}
-        if !cur_id.is_empty() {{
-            rules.push((cur_id, cur_name, cur_act, cur_en));
-        }}
-        for (rid, rname, _, _) in &rules {{
-            if rid == uuid {{
-                target_base = is_trailing_chunk_name(rname);
-                break;
-            }}
-        }}
-        let primary_base = match target_base {{
-            Some(b) => b,
-            None => return false,
-        }};
-        let p1 = format!("{{}}_p1", primary_base);
-        return rules.iter().any(|(rid, rname, ract, ren)| {{
-            rid != uuid
-                && ren.eq_ignore_ascii_case("true")
-                && ract.eq_ignore_ascii_case("block")
-                && (rname == primary_base || rname == &p1)
-        }});
-    }}
-    #[cfg(not(windows))]
-    false
-}}
-
 #[no_mangle]
 pub extern "C" fn sg_cf_mode(
     nonce_ptr: *const u8,
@@ -1078,7 +982,7 @@ pub extern "C" fn sg_cf_request(
     }}
 
     let method = match std::str::from_utf8(method_b) {{
-        Ok(m) if matches!(m, "GET" | "POST" | "PUT" | "PATCH" | "DELETE") => m,
+        Ok(m) if matches!(m, "GET" | "POST" | "PUT" | "PATCH") => m,
         _ => return -3,
     }};
     let rel_path = match std::str::from_utf8(path_b) {{
@@ -1092,10 +996,6 @@ pub extern "C" fn sg_cf_request(
     if !validate_body_policy(method, rel_path, body_str) {{
         return -3;
     }}
-    if method == "DELETE" && !check_delete_rule_safe(rel_path) {{
-        return -3;
-    }}
-
     #[cfg(windows)]
     {{
         match exec_http_raw(method, rel_path, body_b) {{
@@ -1217,7 +1117,25 @@ def execute_sealed_request(
 
 
 def get_cloudflare_transport_config() -> CloudflareTransportConfig:
-    """Resolve transport from stripped native sg_seal.dll (or .env Worker Relay / direct in dev source only)."""
+    """Resolve the user-configured Worker relay before any legacy sealed transport."""
+    # Worker endpoint and app-to-Worker key can be changed in the app without
+    # rebuilding the native library. The Cloudflare API token never enters this
+    # process; it stays in the Worker's Cloudflare dashboard secrets.
+    try:
+        from sentinelgate.config.vault import ApiKeyVault
+
+        relay_settings = ApiKeyVault().get_credentials()
+        worker_url = (relay_settings.get("WORKER_URL") or "").strip().rstrip("/")
+        relay_secret = (relay_settings.get("RELAY_CLIENT_SECRET") or "").strip()
+        if worker_url and relay_secret:
+            parsed = urlparse(worker_url)
+            if parsed.scheme.lower() == "https" and parsed.hostname and not (parsed.username or parsed.password or parsed.query or parsed.fragment):
+                return CloudflareTransportConfig(mode="worker", worker_url=worker_url, worker_token=relay_secret)
+    except Exception:
+        # Keep startup resilient if a vault cannot be read; normal fallback
+        # transport resolution below will report the engine as unavailable.
+        pass
+
     lib = _load_native_seal_dll()
     if lib is not None:
         try:

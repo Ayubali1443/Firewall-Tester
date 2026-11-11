@@ -608,6 +608,8 @@ def create_app(session_token: str | None = None) -> tuple[Flask, str]:
             return jsonify({"ok": True, "status": status})
         except PermissionError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 403
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
 
     @app.post("/api/vault/clear-backup")
     def api_vault_clear_backup() -> Any:
@@ -657,24 +659,16 @@ def create_app(session_token: str | None = None) -> tuple[Flask, str]:
             os.startfile(str(data_dir))
         return jsonify({"ok": True, "data_dir": str(data_dir)})
 
-    @app.get("/api/storage/json/<filename>")
-    def api_get_editable_json(filename: str) -> Any:
-        try:
-            path, content = storage.read_editable_json_text(filename)
-            return jsonify({"ok": True, "filename": filename, "path": str(path), "content": content})
-        except ValueError as exc:
-            return jsonify({"ok": False, "error": str(exc)}), 400
+    @app.get("/api/storage/files")
+    def api_storage_file_manifest() -> Any:
+        return jsonify({"ok": True, **storage.get_dataset_file_manifest()})
 
-    @app.post("/api/storage/json/<filename>")
-    def api_save_editable_json(filename: str) -> Any:
-        payload = request.get_json(force=True) or {}
-        raw_text = str(payload.get("content", ""))
+    @app.post("/api/storage/reload")
+    def api_reload_external_datasets() -> Any:
         try:
-            res = storage.save_editable_json_text(filename, raw_text)
+            res = storage.reload_external_datasets()
             return jsonify({"ok": True, **res})
-        except PermissionError as exc:
-            return jsonify({"ok": False, "error": str(exc)}), 403
-        except Exception as exc:
+        except (OSError, UnicodeError, ValueError) as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
 
     return app, token

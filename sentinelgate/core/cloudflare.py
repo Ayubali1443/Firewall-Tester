@@ -47,7 +47,7 @@ def _build_session(auth_headers: dict[str, str]) -> requests.Session:
         total=5,
         backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["HEAD", "GET", "OPTIONS", "POST", "PATCH", "PUT", "DELETE"],
+            allowed_methods=["HEAD", "GET", "OPTIONS", "POST", "PATCH", "PUT"],
         respect_retry_after_header=True,
     )
     adapter = HTTPAdapter(max_retries=retry_strategy)
@@ -401,11 +401,14 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
 
     Security & Quota Invariants:
     - Only creates/syncs 'block' policies (never 'allow').
+    - Refuses all policy, list, and list-item deletes in every transport mode.
     - Automatically shards lists across _p2/_p3 when exceeding per-list limits (1000/5000).
     - Splits DNS & Search rules within Cloudflare's current Gateway expression limit.
     """
 
     def _http_write(self, method: str, url: str, json_body: Any = None, timeout: float = 20.0) -> Any:
+        if method.upper() == "DELETE":
+            raise PermissionError("Cloudflare policy, list, and list-item deletion is disabled.")
         if self._is_native:
             return self._sealed_http(method, url, json_body=json_body)
         fn = getattr(self._session, method.lower())
@@ -433,9 +436,8 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
             return None
         payload = {
             "name": name,
-            # Keep the relay's hostname-list contract. The Worker translates this
-            # to Cloudflare Gateway's current DOMAIN API enum before forwarding.
-            "type": "HOSTNAME" if self.mode in ("worker", "native_worker") else "DOMAIN",
+            # Cloudflare Gateway's list API uses DOMAIN for hostname entries.
+            "type": "DOMAIN",
             "description": "Auto-generated blocklist by SentinelGate AI Pentester",
         }
         try:
@@ -480,7 +482,10 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
         for i in range(0, len(new_domains), CF_LIST_APPEND_BATCH):
             batch = new_domains[i : i + CF_LIST_APPEND_BATCH]
             payload = {"append": [{"value": d} for d in batch]}
-            res = self._http_write("PATCH", f"{self.lists_url}/{list_id}", json_body=payload, timeout=20)
+            # The Worker exposes PUT for appends, then translates it to
+            # Cloudflare's atomic PATCH so existing items cannot be replaced.
+            append_method = "PUT" if self.mode == "worker" else "PATCH"
+            res = self._http_write(append_method, f"{self.lists_url}/{list_id}", json_body=payload, timeout=20)
             if res.status_code == 200 and res.json().get("success"):
                 pushed += len(batch)
                 if log_cb:
@@ -591,7 +596,9 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
         for i in range(0, len(domains), CF_LIST_APPEND_BATCH):
             batch = domains[i : i + CF_LIST_APPEND_BATCH]
             payload = {"append": [{"value": d} for d in batch]}
-            res = self._http_write("PATCH", f"{self.lists_url}/{list_id}", json_body=payload, timeout=20)
+            # Keep worker callers on the append-only PUT contract.
+            append_method = "PUT" if self.mode == "worker" else "PATCH"
+            res = self._http_write(append_method, f"{self.lists_url}/{list_id}", json_body=payload, timeout=20)
             if res.status_code == 200 and res.json().get("success"):
                 pushed += len(batch)
                 if log_cb:
@@ -666,12 +673,22 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
             r for r in rules
             if "dns" in (r.get("filters") or ["dns"]) and not (r.get("name") or "").startswith(base_name)
         ])
-        if non_managed_dns + len(policy_traffics) > CF_MAX_DNS_POLICIES:
+        dns_slots_required = non_managed_dns + max(len(existing_dns_rules), len(policy_traffics))
+        if dns_slots_required > CF_MAX_DNS_POLICIES:
             if log_cb:
                 log_cb(f"  [X] DNS policy limit ({CF_MAX_DNS_POLICIES}) exceeded.")
             return False
 
         total_parts = len(policy_traffics)
+        dns_precedences = [
+            r.get("precedence") for r in rules
+            if "dns" in (r.get("filters") or [])
+            and not (r.get("name") or "").startswith(base_name)
+            and isinstance(r.get("precedence"), int)
+        ]
+        # Lower values run first. Reserve the slots immediately before all
+        # non-managed DNS policies so our block policy is always prepended.
+        dns_precedence_start = max(0, min(dns_precedences, default=1) - total_parts)
         active_ids: list[str] = []
         errors: list[str] = []
 
@@ -684,14 +701,15 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
                 "traffic": desired_traffic,
                 "enabled": True,
                 "filters": ["dns"],
-                "block_page_enabled": True,
+                "precedence": dns_precedence_start + idx - 1,
             }
 
             target_rule = existing_dns_rules.pop(0) if existing_dns_rules else None
-            if target_rule and isinstance(target_rule.get("precedence"), int):
-                # Gateway precedence values are account-wide. Preserve the current slot
-                # when updating; let Cloudflare append newly-created chunks safely.
-                payload["precedence"] = target_rule["precedence"]
+            # Gateway stores DNS block-page behavior inside rule_settings. Setting
+            # block_page_enabled at the rule root is silently discarded by the API.
+            rule_settings = dict((target_rule or {}).get("rule_settings") or {})
+            rule_settings["block_page_enabled"] = True
+            payload["rule_settings"] = rule_settings
             if (
                 target_rule
                 and target_rule.get("traffic") == desired_traffic
@@ -699,6 +717,8 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
                 and target_rule.get("action") == "block"
                 and target_rule.get("enabled") is True
                 and "dns" in (target_rule.get("filters") or ["dns"])
+                and (target_rule.get("rule_settings") or {}).get("block_page_enabled") is True
+                and target_rule.get("precedence") == payload["precedence"]
             ):
                 active_ids.append(target_rule["id"])
                 continue
@@ -715,17 +735,15 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
             except Exception as exc:
                 errors.append(self._redact(f"DNS {policy_name} error: {exc}"))
 
-        # Trim superseded trailing DNS chunks ONLY if all new DNS chunks succeeded
+        # The relay permanently forbids deletion. Keep obsolete DNS chunks active
+        # after a successful replacement so the old protections remain fail-closed.
         if not errors and len(active_ids) == total_parts and existing_dns_rules:
-            for leftover in existing_dns_rules:
-                if leftover.get("id") not in active_ids:
-                    try:
-                        del_res = self._http_write("DELETE", f"{self.rules_url}/{leftover['id']}", timeout=15)
-                        if del_res.status_code != 200 and log_cb:
-                            log_cb(self._redact(f"  [!] New DNS policy is live, but old chunk cleanup failed: HTTP {del_res.status_code} {del_res.text[:160]}"))
-                    except Exception as exc:
-                        if log_cb:
-                            log_cb(self._redact(f"  [!] New DNS policy is live, but old chunk cleanup failed: {exc}"))
+            leftovers = [r for r in existing_dns_rules if r.get("id") not in active_ids]
+            if leftovers and log_cb:
+                log_cb(
+                    f"  [!] {len(leftovers)} superseded DNS policy chunk(s) remain active; "
+                    "the relay permanently blocks policy deletion. Existing blocks are preserved."
+                )
 
         ok = len(errors) == 0 and len(active_ids) == total_parts
         if log_cb:
@@ -742,12 +760,12 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
         log_cb: Callable[[str], None] | None = None,
         phase_cb: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
-        """Atomically update/push search block rules in-place BEFORE trimming trailing chunks.
+        """Atomically update/push search block rules in-place; never delete Gateway rules.
 
         Anti-Exploit & Limit-Adaptive Design:
         - Checks Cloudflare's 500 HTTP policy account limit before pushing.
-        - Never deletes existing rules before new rules are confirmed live (200 OK).
-        - If ANY network/API error occurs, aborts trailing deletion fail-closed.
+        - Never deletes existing rules. Obsolete trailing rules remain active by relay policy.
+        - If ANY network/API error occurs, existing protections remain active.
         """
         if not traffic_chunks:
             return {"ok": False, "error": "No regex chunks generated.", "sync_phase": "failed"}
@@ -779,13 +797,23 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
             ],
             key=self._rule_sort_key,
         )
+        existing_managed_http_count = len(existing_action_rules)
         non_managed_http = len([
             r for r in rules
             if "http" in (r.get("filters") or []) and not (r.get("name") or "").startswith(base_name)
         ])
-        available_http_slots = max(0, CF_MAX_HTTP_POLICIES - non_managed_http)
-        if len(traffic_chunks) > available_http_slots:
-            msg = f"Search chunks ({len(traffic_chunks)}) exceed available HTTP policy slots ({available_http_slots}/{CF_MAX_HTTP_POLICIES})."
+        http_precedences = [
+            r.get("precedence") for r in rules
+            if "http" in (r.get("filters") or [])
+            and not (r.get("name") or "").startswith(base_name)
+            and isinstance(r.get("precedence"), int)
+        ]
+        # Append after existing HTTP policies; Cloudflare evaluates smaller
+        # precedence values first, so larger values go at the bottom.
+        search_precedence_start = max(http_precedences, default=0) + 1
+        required_http_slots = non_managed_http + max(existing_managed_http_count, len(traffic_chunks))
+        if required_http_slots > CF_MAX_HTTP_POLICIES:
+            msg = f"Search chunks plus retained old policies require {required_http_slots} HTTP slots, exceeding Cloudflare's {CF_MAX_HTTP_POLICIES}-policy cap."
             emit_phase("aborted_preserved", msg)
             if log_cb:
                 log_cb(f"[X] {msg}")
@@ -809,7 +837,7 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
         total_chunks = len(traffic_chunks)
         emit_phase(
             "pushing_in_place",
-            f"Pushing {total_chunks} rule(s) in-place (0 deletions yet - fail-closed)...",
+            f"Pushing {total_chunks} rule(s) in-place; the relay blocks every deletion...",
             pushed=0,
             total=total_chunks,
         )
@@ -825,15 +853,14 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
                 "traffic": traffic,
                 "enabled": True,
                 "filters": ["http"],
+                "precedence": search_precedence_start + part_index - 1,
             }
 
             target_rule = existing_action_rules.pop(0) if existing_action_rules else None
-            if target_rule and isinstance(target_rule.get("precedence"), int):
-                payload["precedence"] = target_rule["precedence"]
-            if target_rule and target_rule.get("block_page"):
-                # A PUT replaces the rule object. Keep a policy-specific redirect
-                # configured in Gateway when changing only the managed expression.
-                payload["block_page"] = target_rule["block_page"]
+            if target_rule and target_rule.get("rule_settings"):
+                # A PUT replaces the rule object. Preserve Gateway policy settings
+                # such as a custom block page while changing the search expression.
+                payload["rule_settings"] = dict(target_rule["rule_settings"])
 
             if (
                 target_rule
@@ -842,6 +869,7 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
                 and target_rule.get("action") == "block"
                 and target_rule.get("enabled") is True
                 and "http" in (target_rule.get("filters") or ["http"])
+                and target_rule.get("precedence") == payload["precedence"]
             ):
                 active_rule_ids.append(target_rule["id"])
                 unchanged_count += 1
@@ -892,9 +920,9 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
                     log_cb(f"  [X] {msg}")
 
         cleaned_obsolete = 0
-        aborted_delete = False
+        aborted_preserved = False
         if errors or len(active_rule_ids) != total_chunks:
-            aborted_delete = True
+            aborted_preserved = True
             emit_phase(
                 "aborted_preserved",
                 "Push interrupted/failed - aborted deletion so existing blocks remain 100% active!",
@@ -907,39 +935,23 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
             leftovers = [r for r in existing_action_rules if r.get("id") not in active_rule_ids]
             if leftovers:
                 emit_phase(
-                    "trimming_trailing",
-                    f"All {total_chunks} new rules LIVE! Trimming {len(leftovers)} superseded trailing rule(s)...",
-                    deleted=0,
-                    delete_total=len(leftovers),
+                    "obsolete_retained",
+                    f"All {total_chunks} new rules LIVE. Retaining {len(leftovers)} superseded rule(s); deletion is disabled.",
+                    retained=len(leftovers),
                 )
                 if log_cb:
-                    log_cb(f"[SYNC PHASE 3/3] All {total_chunks} new rules confirmed LIVE. Trimming {len(leftovers)} obsolete trailing chunk(s)...")
-                for idx_del, leftover_rule in enumerate(leftovers, start=1):
-                    if log_cb:
-                        log_cb(f"  [-] Deleting obsolete trailing rule {leftover_rule.get('name')} ({idx_del}/{len(leftovers)})...")
-                    try:
-                        del_res = self._http_write("DELETE", f"{self.rules_url}/{leftover_rule['id']}", timeout=15)
-                        if del_res.status_code == 200:
-                            cleaned_obsolete += 1
-                        elif log_cb:
-                            log_cb(self._redact(f"  [!] Failed trimming {leftover_rule.get('name')}: HTTP {del_res.status_code} {del_res.text[:160]}"))
-                        emit_phase(
-                            "trimming_trailing",
-                            f"Trimmed obsolete rule {idx_del}/{len(leftovers)}",
-                            deleted=cleaned_obsolete,
-                            delete_total=len(leftovers),
-                        )
-                    except Exception as exc:
-                        if log_cb:
-                            log_cb(self._redact(f"  [!] Failed trimming {leftover_rule.get('name')}: {exc}"))
+                    log_cb(
+                        f"[SYNC PHASE 3/3] All {total_chunks} new rules are live. "
+                        f"Retained {len(leftovers)} obsolete trailing rule(s); the relay does not permit deletion."
+                    )
         else:
             if log_cb:
-                log_cb("[SYNC PHASE 3/3] All rule slots updated in-place - 0 policy deletions needed.")
+                log_cb("[SYNC PHASE 3/3] All rule slots updated in-place; no obsolete rules to retain.")
 
         if not errors and len(active_rule_ids) == total_chunks:
             emit_phase(
                 "completed",
-                f"Sync complete: {total_chunks} live rule(s) enforced ({updated_count} updated, {unchanged_count} unchanged, {cleaned_obsolete} trimmed).",
+                f"Sync complete: {total_chunks} live rule(s) enforced ({updated_count} updated, {unchanged_count} unchanged).",
                 pushed=total_chunks,
                 total=total_chunks,
                 deleted=cleaned_obsolete,
@@ -947,11 +959,14 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
 
         return {
             "ok": len(errors) == 0 and len(active_rule_ids) == total_chunks,
-            "sync_phase": "aborted_preserved" if aborted_delete else "completed",
-            "aborted_delete_preserved_protection": aborted_delete,
+            "sync_phase": "aborted_preserved" if aborted_preserved else "completed",
+            "aborted_delete_preserved_protection": aborted_preserved,
             "total_chunks": total_chunks,
             "updated": updated_count,
             "unchanged": unchanged_count,
-            "consolidated_extra": cleaned_obsolete,
+            "consolidated_extra": 0,
+            "obsolete_retained": sum(
+                1 for r in existing_action_rules if r.get("id") not in active_rule_ids
+            ) if not aborted_preserved else 0,
             "errors": errors,
         }

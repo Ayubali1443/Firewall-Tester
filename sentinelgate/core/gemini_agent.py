@@ -198,9 +198,9 @@ CONTEXT & TARGETING CONSTRAINTS (CRITICAL):
 - Desktop VPN client installations and local software installs are ALREADY blocked at the OS Standard User policy level.
 - DO NOT waste suggestions on famous mainstream adult sites (e.g., pornhub, xvideos), desktop VPN software vendors (e.g., nordvpn, wireguard), or encrypted DNS servers.
 - YOUR STRICT FOCUS IS SLIP-THROUGHS:
-  1. Web-based proxies, CGI proxies (Glype, PHProxy, MiniProxy, Rammerhead, Ultraviolet), serverless `.workers.dev`/`.vercel.app` proxy portals, and HTML/browser-in-browser unblockers.
+  1. Web-based proxies, CGI proxies (Glype, PHProxy, MiniProxy, Rammerhead, Ultraviolet), serverless `.workers.dev`/`.vercel.app` proxy portals, but don't block the vercel or the workers.dev as both are important and HTML/browser-in-browser unblockers.
   2. Obscure or newly rotated adult domains, niche leak hubs, and dedicated SOLE-PORN / nude / topless image-hosting websites that evade standard Cloudflare DNS categorization.
-  3. Web-based media rippers, stream converters, and APK/software download portals.
+  3. Web-based media rippers, stream converters, and APK/software download portals, or something defined in the below description and category.
 - CRITICAL IMAGE-HOST RULE: NEVER suggest multipurpose CDNs or general cloud/asset hosts (e.g., cloudfront.net, s3.amazonaws.com, imagedelivery.net, googleusercontent.com, azureedge.net, fastly.net, akamaized.net, cloudinary.com, imgix.net, b-cdn.net, imgur.com, postimg.cc, imgbb, githubusercontent.com). ONLY target dedicated porn/nude/topless image-hosting sites.
 
 TARGET CATEGORY: '{category}'

@@ -42,6 +42,23 @@ async function readJsonSafe(request) {
   }
 }
 
+function getAppendPayload(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body) ||
+      Object.keys(body).length !== 1 || !Array.isArray(body.append)) return null;
+  const append = [];
+  for (const item of body.append) {
+    if (!item || typeof item !== "object" || Array.isArray(item) ||
+        typeof item.value !== "string" || !item.value.trim() ||
+        Object.keys(item).some((key) => key !== "value" && key !== "description") ||
+        (item.description !== undefined && typeof item.description !== "string")) return null;
+    append.push({
+      value: item.value.trim(),
+      ...(item.description === undefined ? {} : { description: item.description }),
+    });
+  }
+  return { append };
+}
+
 async function cfFetch(env, path, init = {}) {
   const url = `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/gateway${path}`;
   const headers = {
@@ -74,6 +91,20 @@ export default {
     const path = url.pathname;
     const method = request.method.toUpperCase();
 
+    // Deletion is permanently disabled for every policy, list, and list item.
+    // Decode and normalize before checking so encoded or repeated separators do
+    // not create an alternate route around this guard.
+    let normalizedPath;
+    try {
+      normalizedPath = decodeURIComponent(path).replace(/\/{2,}/g, "/").replace(/\/+$/, "");
+    } catch {
+      return jsonResp({ success: false, error: "Malformed resource path." }, 400);
+    }
+    const protectedResourcePath = /^\/v1\/(?:rules|lists)(?:\/|$)/i.test(normalizedPath);
+    if (method === "DELETE" && protectedResourcePath) {
+      return jsonResp({ success: false, error: "Policy, list, and list-item deletion is permanently disabled." }, 403);
+    }
+
     if (method === "GET" && path === "/v1/health") {
       const rulesRes = await cfFetch(env, "/rules?per_page=100", { method: "GET" });
       const rulesData = await rulesRes.json();
@@ -102,29 +133,42 @@ export default {
       const parsed = await readJsonSafe(request);
       if (!parsed.ok) return jsonResp({ success: false, error: "Invalid JSON payload." }, 400);
       const body = parsed.body;
-      if (body?.type !== "HOSTNAME" && body?.type !== "DOMAIN") {
-        return jsonResp({ success: false, error: "Only hostname/domain lists are permitted." }, 403);
+      if (body?.type !== "DOMAIN") {
+        return jsonResp({ success: false, error: "Only DOMAIN lists are permitted." }, 403);
       }
-      // The desktop contract uses HOSTNAME for DNS targets. Cloudflare Gateway's
-      // current API enum for that list data is DOMAIN.
-      return cfFetch(env, "/lists", {
-        method: "POST",
-        body: JSON.stringify({ ...body, type: "DOMAIN" }),
-      });
+      return cfFetch(env, "/lists", { method: "POST", body: JSON.stringify(body) });
     }
 
     if (method === "PATCH" && listMatch) {
       const parsed = await readJsonSafe(request);
       if (!parsed.ok) return jsonResp({ success: false, error: "Invalid JSON payload." }, 400);
-      const body = parsed.body;
-      // Strictly append-only: forbid removing or overwriting existing blocked items
-      if (!Array.isArray(body?.append) || body?.remove || body?.items) {
+      const appendPayload = getAppendPayload(parsed.body);
+      if (!appendPayload) {
         return jsonResp({ success: false, error: "Only append operations are permitted." }, 403);
       }
       return cfFetch(env, `/lists/${listMatch[1]}`, {
         method: "PATCH",
-        body: JSON.stringify({ append: body.append }),
+        body: JSON.stringify(appendPayload),
       });
+    }
+
+    // App-facing PUT is an append operation. Cloudflare's list PUT replaces
+    // items, so translate only this strict append payload to its atomic PATCH.
+    if (method === "PUT" && listMatch) {
+      const parsed = await readJsonSafe(request);
+      if (!parsed.ok) return jsonResp({ success: false, error: "Invalid JSON payload." }, 400);
+      const appendPayload = getAppendPayload(parsed.body);
+      if (!appendPayload) {
+        return jsonResp({ success: false, error: "PUT accepts only an append array; existing list items are preserved." }, 403);
+      }
+      return cfFetch(env, `/lists/${listMatch[1]}`, {
+        method: "PATCH",
+        body: JSON.stringify(appendPayload),
+      });
+    }
+
+    if (method === "PUT" && /^\/v1\/lists(?:\/|$)/i.test(normalizedPath)) {
+      return jsonResp({ success: false, error: "Unsupported list route." }, 404);
     }
 
     if (method === "GET" && path === "/v1/rules") {
@@ -150,35 +194,6 @@ export default {
         return jsonResp({ success: false, error: "Only enabled block rules are permitted." }, 403);
       }
       return cfFetch(env, `/rules/${ruleMatch[1]}`, { method: "PUT", body: JSON.stringify(body) });
-    }
-
-    if (method === "DELETE" && ruleMatch) {
-      // Allow removing ONLY trailing split chunks during regex/DNS consolidation
-      // AND only when an active primary block rule remains enabled
-      const allRulesRes = await cfFetch(env, "/rules?per_page=100", { method: "GET" });
-      const allRules = (await allRulesRes.json())?.result || [];
-      const targetRule = allRules.find((r) => r.id === ruleMatch[1]);
-      const ruleName = targetRule?.name || "";
-      const isTrailingSearch = /^automated_http_search_block_p([2-9]|[1-9]\d+)$/.test(ruleName);
-      const isTrailingDns = /^automated_block_p([2-9]|[1-9]\d+)$/.test(ruleName);
-      if (!isTrailingSearch && !isTrailingDns) {
-        return jsonResp({ success: false, error: "Policy deletion is prohibited." }, 403);
-      }
-      const primaryPrefix = isTrailingSearch ? "automated_http_search_block" : "automated_block";
-      const hasPrimaryBlock = allRules.some(
-        (r) =>
-          r.id !== ruleMatch[1] &&
-          r.enabled === true &&
-          r.action === "block" &&
-          (r.name === primaryPrefix || r.name === `${primaryPrefix}_p1`)
-      );
-      if (!hasPrimaryBlock) {
-        return jsonResp(
-          { success: false, error: "Cannot delete trailing chunk without an active primary block rule." },
-          403
-        );
-      }
-      return cfFetch(env, `/rules/${ruleMatch[1]}`, { method: "DELETE" });
     }
 
     return jsonResp({ success: false, error: "Unsupported relay route." }, 404);

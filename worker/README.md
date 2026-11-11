@@ -2,7 +2,7 @@
 
 Deploying the Cloudflare Worker relay is the **only way to guarantee that `ACCOUNT_ID` and `API_TOKEN` never exist anywhere on end-user computers** — not on disk, not inside `SentinelGateAI.exe`, not inside `sg_seal.dll`, and not in process memory.
 
-Only the Worker URL (`WORKER_URL`) and a server-restricted shared key (`RELAY_CLIENT_SECRET`) are sealed into the desktop binary.
+The desktop app stores the Worker URL (`WORKER_URL`) and app-to-Worker shared key (`RELAY_CLIENT_SECRET`) in its per-user Windows DPAPI vault. Both can be edited in **API Vault & Security** without rebuilding the app. The Cloudflare API token is configured only as a Cloudflare Worker Secret.
 
 ---
 
@@ -13,11 +13,12 @@ Even if an attacker inspects a client computer, the real Cloudflare API credenti
 1. **Zero Cloudflare keys on client PCs:** `CF_ACCOUNT_ID` and `CF_API_TOKEN` never leave Cloudflare infrastructure.
 2. **Constant-time client auth (`X-SG-Relay-Key`):** Every route rejects missing or wrong relay keys with `401 Unauthorized`.
 3. **Server-side Block-Only Policy Firewall (`403 Forbidden`):**
-   - `POST /v1/lists`: permits hostname/domain lists and translates the client `HOSTNAME` type to Cloudflare Gateway's `DOMAIN` API type.
+   - `POST /v1/lists`: permits only `type: "DOMAIN"` (Cloudflare Zero Trust Gateway domain/hostname lists).
    - `PATCH /v1/lists/:id`: **append-only** (forbids `remove` or overwriting `items`).
+   - `PUT /v1/lists/:id`: accepts only an `append` array and maps it to Cloudflare's append-only `PATCH`. Cloudflare's native list `PUT` replaces a nonempty `items` array, so replacement payloads are never forwarded.
    - `POST /v1/rules` & `PUT /v1/rules/:id`: enforces `action === "block"` and `enabled === true` (blocks creating `allow` rules or disabling policies).
-   - `DELETE /v1/rules/:id`: strictly blocked except removing trailing shard chunks (`automated_block_p2+` / `automated_http_search_block_p2+`) while an active primary `block` rule still exists.
-4. **Native WinHTTP Transport Pinning (`sg_seal.dll`):** Compiled builds also seal `WORKER_URL` and `RELAY_CLIENT_SECRET` inside stripped native Rust code with `WINHTTP_ACCESS_TYPE_NO_PROXY`, `HCCE_LOCAL_MACHINE` TLS certificate-chain verification (ignoring user-added `CurrentUser\Root` MITM certificates), and `volatile_zero` memory clearing.
+   - Every `DELETE` request under `/v1/rules` or `/v1/lists` is rejected with `403`, including encoded paths, primary policies, trailing shards, lists, and list items. The relay never forwards a delete operation to Cloudflare.
+4. **Client transport:** The app uses HTTPS with environment proxy overrides disabled. The Worker URL is user-configurable in the app; the Cloudflare API token remains exclusively in the Worker runtime.
 
 ---
 
@@ -80,6 +81,19 @@ npx wrangler secret put RELAY_CLIENT_SECRET
 
 Then copy the deployed `https://sentinelgate-relay.<your-subdomain>.workers.dev` URL into `WORKER_URL` inside root `.env` (along with the same `RELAY_CLIENT_SECRET` you entered above).
 
+### Updating Worker Code After Initial Setup
+
+For later code-only changes to `sentinelgate-relay.js`, use the update script instead of rerunning the first-time setup. It checks the live relay, runs a JavaScript syntax check and Wrangler dry run, deploys without changing Worker secrets, then verifies health and that policy/list/item DELETE requests return `403`. If post-deploy checks fail, it attempts to roll back to the prior Worker version.
+
+From the repository root:
+
+```powershell
+.\worker\deploy-worker-update.ps1 -DryRun
+.\worker\deploy-worker-update.ps1
+```
+
+The dry run does not deploy. The second command publishes the code update. Neither command creates, edits, or deletes Cloudflare policies, lists, or list items. For changes to `.env` secrets or first-time setup, use `setup-worker.ps1` instead.
+
 ---
 
 ## Step 3: Verify Worker Relay Live
@@ -98,23 +112,19 @@ Invoke-RestMethod -Uri "https://sentinelgate-relay.<your-subdomain>.workers.dev/
 
 ## Step 4: Build the Zero-Token Desktop Installer
 
-Once `WORKER_URL` and `RELAY_CLIENT_SECRET` are set in `.env`:
+After deploying the Worker, set `WORKER_URL` and `RELAY_CLIENT_SECRET` in **API Vault & Security** in the app. `.env` is only needed for the Worker setup script; the installer build does not embed or require relay settings.
 
 ```powershell
 .\.venv\Scripts\python.exe build.py
 ```
 
-`build.py` automatically:
-1. Reads `WORKER_URL` and `RELAY_CLIENT_SECRET` from `.env` (non-interactively).
-2. Verifies live `/v1/health` authentication AND confirms unauthenticated requests return `401`.
-3. Compiles native `sg_seal.dll` sealing **only** the Worker URL + relay key (`ACCOUNT_ID` and `API_TOKEN` are **never** included).
-4. Builds `dist\SentinelGateAI-Setup.exe` and scans it to verify zero plaintext secrets exist in the output binary.
+`build.py` builds the installer without Worker credentials. Installed users configure or update their Worker URL and relay client key in the app without rebuilding.
 
-When users install `SentinelGateAI-Setup.exe`, SentinelGate AI prompts only for their **Gemini AI API key** inside the desktop app UI (stored per-user via Windows DPAPI).
+When users install `SentinelGateAI-Setup.exe`, they configure the Worker URL, relay client key, and optional Gemini keys inside the app UI (stored per-user via Windows DPAPI).
 
 ---
 
 ## Rotating Keys Later
 
-- **Rotate Cloudflare `API_TOKEN` (no client rebuild needed):** Create a new token in Cloudflare, update `API_TOKEN` in `.env`, run `npx wrangler secret put CF_API_TOKEN` inside `worker/`, and revoke the old token. Existing installed desktop apps keep working seamlessly!
-- **Rotate `RELAY_CLIENT_SECRET` (invalidates old installers):** Generate a new `RELAY_CLIENT_SECRET` in `.env`, push it to the Worker (`npx wrangler secret put RELAY_CLIENT_SECRET`), rebuild `build.py`, and redistribute `SentinelGateAI-Setup.exe`.
+- **Rotate Cloudflare `API_TOKEN`:** Create a new least-privilege token in Cloudflare, update the `CF_API_TOKEN` Worker Secret in the Cloudflare dashboard, verify the relay, then revoke the old token. Existing apps continue working; no source access or rebuild is needed.
+- **Rotate `RELAY_CLIENT_SECRET`:** Update the Worker Secret in the Cloudflare dashboard, then enter the matching value in each app's **API Vault & Security** settings. No rebuild is needed.

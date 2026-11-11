@@ -103,7 +103,7 @@ try {
     if ($detectedUrl) {
         Write-Host "Next step: build the client installer with:  .\.venv\Scripts\python.exe build.py"
     } else {
-        Write-Host "Next step: paste your deployed https://...workers.dev URL into WORKER_URL in .env, then run:  .\.venv\Scripts\python.exe build.py"
+    Write-Host "Next step: install/run SentinelGate AI, then enter the deployed Worker URL and matching relay key in API Vault & Security."
     }
 } finally {
     Pop-Location

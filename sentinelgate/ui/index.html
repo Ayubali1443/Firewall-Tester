@@ -61,7 +61,7 @@
         <div class="nav-section-label">SYSTEM &amp; CREDENTIALS</div>
         <button class="nav-btn" data-view="jsoneditor">
           <span class="nav-dot cyan"></span>
-          <span>JSON Files Editor</span>
+          <span>JSON Data Files</span>
         </button>
         <button class="nav-btn" data-view="settings">
           <span class="nav-dot slate"></span>
@@ -72,7 +72,7 @@
       <div class="sidebar-footer">
         <div class="lock-item">✓ No Allow-Listing</div>
         <div class="lock-item">✓ No Policy Deletion</div>
-        <div class="lock-item">✓ Immutable Baseline</div>
+        <div class="lock-item">✓ JSON-Managed Active Lists</div>
         <div class="lock-item">✓ DPAPI Encrypted Vault</div>
       </div>
     </aside>
@@ -337,9 +337,10 @@
 
           <div class="panel">
             <div class="panel-header">
-              <h2>DNS Blocklist Explorer (Read &amp; Append Only)</h2>
+              <h2>DNS Blocklist Explorer</h2>
               <input type="search" id="dns-filter-input" class="search-input" placeholder="Filter domains or categories..." oninput="renderDnsCategories()" />
             </div>
+            <p class="hint">The JSON file is the active local list. Removing an entry and reloading removes it from this tool and future local checks. Cloudflare entries already pushed remain protected there and are never deleted by this app.</p>
             <div id="dns-categories-container" class="cat-grid"></div>
           </div>
         </section>
@@ -437,6 +438,7 @@
               <h2>Search Blocklist Categories</h2>
               <input type="search" id="search-filter-input" class="search-input" placeholder="Filter keywords or categories..." oninput="renderSearchCategories()" />
             </div>
+            <p class="hint">The JSON file is the active local list. Removing a term and reloading removes it from this tool and future local checks. Search policies already pushed to Cloudflare are never deleted by this app.</p>
             <div id="search-categories-container" class="cat-grid"></div>
           </div>
         </section>
@@ -580,7 +582,7 @@
                 <span class="tag tag-emerald">AI Keys Editable Only</span>
               </div>
               <p class="hint">
-                Only Gemini AI API keys can be edited here and are sealed using Windows DPAPI (<code>CryptProtectData</code>). Leave any field untouched to keep its current stored value.
+                Gemini keys and Worker relay settings are encrypted with Windows DPAPI (<code>CryptProtectData</code>). Leave a field blank to keep its current stored value.
               </p>
               <div class="form-group">
                 <label for="vault-gemini-primary">Gemini API Key (Primary) <span id="badge-gem-p" class="mini-status"></span></label>
@@ -590,15 +592,24 @@
                 <label for="vault-gemini-backup">Gemini API Key (Optional Backup Failover) <span id="badge-gem-b" class="mini-status"></span></label>
                 <input type="password" id="vault-gemini-backup" autocomplete="off" placeholder="Optional fallback Gemini API key..." />
               </div>
+              <div class="form-group">
+                <label for="vault-worker-url">Cloudflare Worker Relay URL <span id="badge-worker-url" class="mini-status"></span></label>
+                <input type="url" id="vault-worker-url" autocomplete="url" placeholder="https://your-relay.workers.dev" />
+              </div>
+              <div class="form-group">
+                <label for="vault-worker-secret">Worker Relay Client Key <span id="badge-worker-secret" class="mini-status"></span></label>
+                <input type="password" id="vault-worker-secret" autocomplete="new-password" placeholder="Enter the relay shared key..." />
+              </div>
+              <p class="hint">The Worker URL and app-to-Worker key are stored in your Windows DPAPI vault and can be changed here. The Cloudflare API token stays in Cloudflare Worker Secrets; rotate it in the Cloudflare dashboard without changing or rebuilding the app.</p>
               <div class="mini-row" style="margin: 4px 0;">
                 <div>
-                  <div><strong>Cloudflare Gateway Credentials</strong></div>
-                  <div class="muted">Sealed &amp; locked inside stripped native machine code. Zero token export, anti-debug &amp; direct TLS enforced.</div>
+                  <div><strong>Cloudflare API Token</strong></div>
+                  <div class="muted">Managed as an encrypted Worker Secret in the Cloudflare dashboard; it is never stored in this app.</div>
                 </div>
-                <span id="badge-cf-sealed" class="badge badge-lock">SEALED &amp; LOCKED</span>
+                <span id="badge-cf-sealed" class="badge badge-lock">WORKER ONLY</span>
               </div>
               <div class="btn-row">
-                <button class="btn btn-primary" onclick="saveVaultCredentials()">Save AI Keys to DPAPI Vault</button>
+                <button class="btn btn-primary" onclick="saveVaultCredentials()">Save Settings to DPAPI Vault</button>
                 <button class="btn btn-secondary" onclick="testVaultConnections()">Test AI &amp; Cloudflare Health</button>
                 <button class="btn btn-ghost" onclick="clearBackupGeminiKey()">Clear Backup Key</button>
               </div>
@@ -618,14 +629,15 @@
 
           <div class="panel">
             <div class="panel-header">
-              <h2>Editable JSON Datasets (Post-Install Add-Only)</h2>
-              <span class="tag tag-emerald">Append-Safe</span>
+              <h2>JSON Data Files</h2>
+              <span class="tag tag-cyan">Edit Outside the App</span>
             </div>
             <p class="hint">
-              Edit <code>dns_blocklist.json</code>, <code>search_blocklist.json</code>, <code>dns_uptime_sites.json</code>, or <code>search_uptime_terms.json</code> in <code id="json-data-dir-path">data/</code> anytime after installation to add more blocks or uptime checks. Removing entries from JSON files never removes existing protections from Cloudflare.
+              This page only shows file locations and timestamps; it does not edit or save JSON content. Edit files with Explorer or your preferred text editor, then select <strong>Reload JSON Files</strong> to refresh the DNS, search, Uptester, and overview screens. Reload refreshes the active local datasets and clears stale test state; it does not push policy changes to Cloudflare. Entries already pushed to Cloudflare remain there because remote deletion is disabled.
             </p>
+            <p class="hint">Data folder: <code id="json-data-dir-overview">data/</code></p>
+            <div id="json-files-list-overview" class="diag-list"></div>
             <div class="btn-row">
-              <button class="btn btn-primary" onclick="switchView('jsoneditor')">Open Built-In JSON Editor</button>
               <button class="btn btn-secondary" onclick="openDataFolder()">Open JSON Data Folder</button>
               <button class="btn btn-ghost" onclick="reloadDatasetsFromJson()">Reload JSON Files</button>
             </div>
@@ -633,38 +645,26 @@
           </div>
         </section>
 
-        <!-- VIEW 7: BUILT-IN JSON EDITOR (POST-INSTALL ADD-ONLY SAFE) -->
+        <!-- VIEW 7: JSON DATA FILE LOCATIONS -->
         <section id="view-jsoneditor" class="view">
           <div class="panel">
             <div class="panel-header">
-              <h2>Post-Install JSON Dataset Editor</h2>
-              <span class="tag tag-emerald">Deleting Items Never Removes Cloudflare Blocks</span>
+              <h2>JSON Data Files</h2>
+              <span class="tag tag-cyan">Read-Only Locations</span>
             </div>
             <p class="hint">
-              Edit JSON datasets directly below or open <code id="json-editor-filepath">data/</code> in Explorer. Adding items updates active datasets immediately; deleting items from JSON never removes existing protections from Cloudflare.
+              Open the data folder to edit files outside the app. After saving a file, reload to validate it and refresh the app's data and test state. Reload does not change Cloudflare policies. DNS lists are append-only; use the Search tab's sync action to publish search-term changes.
             </p>
-            <div class="form-row">
-              <div class="form-group flex-1">
-                <label for="json-editor-select">Select JSON File</label>
-                <select id="json-editor-select" onchange="loadSelectedJsonFile()">
-                  <option value="dns_blocklist.json">dns_blocklist.json (DNS Blocked Domains)</option>
-                  <option value="search_blocklist.json">search_blocklist.json (HTTP Search Terms)</option>
-                  <option value="dns_uptime_sites.json">dns_uptime_sites.json (Essential Uptime Domains)</option>
-                  <option value="search_uptime_terms.json">search_uptime_terms.json (Essential Uptime Queries)</option>
-                </select>
-              </div>
-            </div>
-            <div class="form-group">
-              <label for="json-editor-textarea">JSON Content</label>
-              <textarea id="json-editor-textarea" rows="18" style="font-family: Consolas, monospace; font-size: 12px; width: 100%;"></textarea>
-            </div>
+            <p class="hint">
+              Blocklists are category objects: <code>dns_blocklist.json</code> uses <code>"Category+block": {"category":"Category","action":"block","domains":["example.com"]}</code>; <code>search_blocklist.json</code> uses the same shape with a <code>terms</code> array. Uptime files use <code>domains</code> or <code>terms</code> arrays per category.
+            </p>
+            <p class="hint">Data folder: <code id="json-data-dir-path">Loading…</code></p>
+            <div id="json-files-list" class="diag-list"></div>
             <div class="btn-row">
-              <button class="btn btn-primary" onclick="saveJsonEditorFile()">Save JSON Changes</button>
-              <button class="btn btn-secondary" onclick="formatJsonEditorText()">Format JSON</button>
               <button class="btn btn-secondary" onclick="openDataFolder()">Open Folder in Explorer</button>
-              <button class="btn btn-ghost" onclick="loadSelectedJsonFile()">Reload from Disk</button>
+              <button class="btn btn-ghost" onclick="reloadDatasetsFromJson()">Reload JSON Files</button>
             </div>
-            <div id="json-editor-feedback" class="feedback"></div>
+            <div id="json-file-feedback" class="feedback"></div>
           </div>
         </section>
       </main>
@@ -700,7 +700,7 @@
         <span class="badge badge-lock">DPAPI Encrypted</span>
       </div>
       <p class="muted">
-        Cloudflare protection is already sealed in native code. Enter your Google Gemini API key below to enable AI slip-through hunting &amp; autonomous scans.
+        Configure the Worker relay in API Vault &amp; Security, then enter your Google Gemini API key to enable AI slip-through hunting &amp; autonomous scans.
       </p>
       <div class="form-group">
         <label for="modal-gemini-primary">Gemini API Key (Primary)</label>

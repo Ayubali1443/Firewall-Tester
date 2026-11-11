@@ -1,7 +1,7 @@
-"""Windows DPAPI-encrypted secret vault for user-editable AI (Gemini) credentials ONLY.
+"""Windows DPAPI-encrypted vault for Gemini keys and Worker relay settings.
 
-Cloudflare credentials are intentionally excluded from this vault and never exposed
-or editable at runtime so end-users cannot inspect or misuse Cloudflare API tokens.
+The Cloudflare API token remains exclusively in Cloudflare Worker Secrets. The
+relay client key stored here is only the app-to-Worker shared key.
 """
 
 from __future__ import annotations
@@ -139,14 +139,16 @@ def extract_legacy_cf_from_vault(vault_path: Path | None = None, purge: bool = F
 
 
 class ApiKeyVault:
-    """Manages DPAPI-encrypted storage exclusively for editable Gemini AI API keys."""
+    """Manages DPAPI-encrypted user-editable app and relay credentials."""
 
     FIELDS = (
         "GEMINI_API_KEY",
         "GEMINI_API_KEY_BACKUP",
+        "WORKER_URL",
+        "RELAY_CLIENT_SECRET",
     )
 
-    FORBIDDEN_FIELDS = ("CF_ACCOUNT_ID", "CF_API_TOKEN")
+    FORBIDDEN_FIELDS = ("CF_ACCOUNT_ID", "ACCOUNT_ID", "CF_API_TOKEN", "API_TOKEN", "CF_API_KEY")
 
     def __init__(self, vault_path: Path | None = None) -> None:
         self.vault_path = vault_path or (get_app_data_dir() / "vault.dpapi")
@@ -232,24 +234,34 @@ class ApiKeyVault:
         return creds
 
     def get_masked_status(self) -> dict[str, Any]:
-        """Return masked status of editable AI keys only (never exposes paths or Cloudflare internals)."""
+        """Return masked secret status; the Worker URL is safe to display in the local UI."""
         creds = self.get_credentials()
+        keys = {
+            field: {
+                "configured": bool(creds.get(field)),
+                "masked": creds.get(field, "") if field == "WORKER_URL" else mask_secret(creds.get(field)),
+            }
+            for field in self.FIELDS
+        }
         return {
             "vault_encrypted": self.vault_path.exists(),
-            "keys": {
-                field: {
-                    "configured": bool(creds.get(field)),
-                    "masked": mask_secret(creds.get(field)),
-                }
-                for field in self.FIELDS
-            },
+            "keys": keys,
         }
 
     def update_credentials(self, updates: dict[str, str]) -> dict[str, Any]:
-        """Securely update editable AI API keys only; rejects Cloudflare credential mutations."""
+        """Securely update AI and Worker relay settings; never accepts Cloudflare API credentials."""
         for forbidden in self.FORBIDDEN_FIELDS:
-            if forbidden in updates and str(updates[forbidden] or "").strip():
-                raise PermissionError("Cloudflare credentials are immutable and sealed.")
+            if forbidden in updates:
+                raise PermissionError("Cloudflare API credentials are managed as Worker Secrets in Cloudflare.")
+
+        if "WORKER_URL" in updates:
+            worker_url = str(updates["WORKER_URL"] or "").strip().rstrip("/")
+            if worker_url:
+                from urllib.parse import urlparse
+
+                parsed = urlparse(worker_url)
+                if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+                    raise ValueError("Worker URL must be a valid https:// URL without credentials, query, or fragment.")
 
         current = self.get_credentials()
         for field in self.FIELDS:

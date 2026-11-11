@@ -22,7 +22,7 @@ Secondary Strict Web Filter & On-Demand AI Threat Hunter targeting web proxies, 
 - `worker/` — **Zero-Token Cloudflare Worker Relay** (`sentinelgate-relay.js`, `wrangler.toml`, `setup-worker.ps1`, [`worker/README.md`](worker/README.md)) so Cloudflare API credentials never ship to client computers
 - `data/` — Consolidated blocklists, uptime baselines, and cached test states
 - `tests/` — Automated verification suite
-- `build.py` — **The single build script**: live-tests the deployed Worker Relay, seals `WORKER_URL` + `RELAY_CLIENT_SECRET` into `sg_seal.dll`, compiles via Nuitka (`--onefile`), and produces `dist/SentinelGateAI-Setup.exe`
+- `build.py` — **The single build script**: compiles a runtime-configured installer via Nuitka (`--onefile`) and produces `dist/SentinelGateAI-Setup.exe`
 - `setup.ps1` — Developer dependency & environment installer (`.venv`, Python packages, Rust `cf_validator.exe`, tests)
 - `clean.ps1` — Removes all regenerable dependencies, caches, and build artifacts
 
@@ -45,22 +45,22 @@ See the full step-by-step setup guide at [`worker/README.md`](worker/README.md).
    npx wrangler login
    .\worker\setup-worker.ps1
    ```
-   This deploys `worker/sentinelgate-relay.js`, uploads `CF_ACCOUNT_ID`, `CF_API_TOKEN`, and `RELAY_CLIENT_SECRET` as encrypted Cloudflare Worker Secrets, and saves `WORKER_URL` & `RELAY_CLIENT_SECRET` into `.env`.
+   This deploys `worker/sentinelgate-relay.js`, uploads `CF_ACCOUNT_ID`, `CF_API_TOKEN`, and `RELAY_CLIENT_SECRET` as encrypted Cloudflare Worker Secrets, and saves setup values to `.env` for developer use. Installed users configure the Worker URL and relay client key in the app's **API Vault & Security** page.
 
 ### 3. Build Single-File Installer (`dist/SentinelGateAI-Setup.exe`)
 
-There is one single build script ([`build.py`](build.py)) and it requires **no interactive prompts**. Once `WORKER_URL` and `RELAY_CLIENT_SECRET` are populated in `.env`, run:
+There is one single build script ([`build.py`](build.py)) and it requires **no interactive prompts**. Run it to produce an installer; the Worker URL and relay client key are configured after install in the app:
 
 ```powershell
 .\.venv\Scripts\python.exe build.py
 ```
 
-Before compiling, `build.py` reads `WORKER_URL` and `RELAY_CLIENT_SECRET` from `.env`, live-tests `/v1/health` (and verifies unauthenticated callers get `401`), seals only the Worker Relay endpoint + relay key inside stripped native Rust WinHTTP machine code (`sg_seal.dll`) while leaving `ACCOUNT_ID` and `API_TOKEN` off client builds completely, compiles the desktop shell via Nuitka (`--onefile`), verifies no plaintext secrets exist in the output binary, and outputs `dist/SentinelGateAI-Setup.exe` (zero admin privileges needed). The **Gemini AI API key** is requested only after opening SentinelGate AI and saved per-user in Windows DPAPI.
+`build.py` outputs `dist/SentinelGateAI-Setup.exe` (zero admin privileges needed) without embedding relay settings. In installed app settings, users can edit the Worker URL and relay client key; both are stored in the per-user Windows DPAPI vault. The Cloudflare API token stays in Cloudflare Worker Secrets and is rotated in the Cloudflare dashboard without app or source code changes.
 
 ### 4. Installing, Editing JSONs & Uninstalling
 
 - **Install**: Run `dist\SentinelGateAI-Setup.exe`. It installs `SentinelGateAI.exe` and `Uninstall.exe` to `%LOCALAPPDATA%\Programs\SentinelGateAI`, initializes `%LOCALAPPDATA%\Programs\SentinelGateAI\data\*.json`, ensures WebView2 Runtime is available, creates Desktop & Start Menu shortcuts (including **Uninstall SentinelGate AI**), and registers standard **Windows Installed Apps** uninstall metadata.
-- **Edit JSON Files in Production**: Use the built-in **JSON Files Editor** tab inside SentinelGate AI, or open `%LOCALAPPDATA%\Programs\SentinelGateAI\data\` in Explorer (**API Vault & Security → Open JSON Data Folder**) to edit `dns_blocklist.json`, `search_blocklist.json`, `dns_uptime_sites.json`, or `search_uptime_terms.json`. Adding items enables them immediately; deleting entries from JSON never removes existing blocks from Cloudflare.
+- **Edit JSON Files in Production**: Open `%LOCALAPPDATA%\Programs\SentinelGateAI\data\` in Explorer (**API Vault & Security → Open JSON Data Folder**) to edit `dns_blocklist.json`, `search_blocklist.json`, `dns_uptime_sites.json`, or `search_uptime_terms.json`, then select **Reload JSON Files**. The JSON files define the active local datasets used by the tool. Removing entries updates the explorer and subsequent local checks; already-pushed Cloudflare policies, lists, and items are retained because remote deletion is disabled.
 - **Uninstall**: Uninstall anytime via **Windows Settings → Apps → Installed apps → SentinelGate AI → Uninstall**, via the Start Menu **Uninstall SentinelGate AI** shortcut, or by running:
   ```powershell
   "%LOCALAPPDATA%\Programs\SentinelGateAI\Uninstall.exe" --uninstall

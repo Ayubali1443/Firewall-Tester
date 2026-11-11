@@ -193,56 +193,11 @@ def prepare_native_seal(
     skip_live_check: bool = False,
     allow_unsafe_direct: bool = False,
 ) -> None:
-    """Load Zero-Token Worker Relay config from `.env`, live-test it, and seal into native DLL.
-
-    CF_ACCOUNT_ID and CF_API_TOKEN are NEVER embedded when using Worker Relay mode.
-    """
-    print("[2/4] Reading Worker Relay config from .env/environment & running pre-build API check...")
+    """Prepare a runtime-configured Worker transport without embedding relay credentials."""
+    print("[2/4] Preparing runtime-configured Worker transport...")
     extract_legacy_cf_from_vault(purge=True)
-
-    worker_url, relay_secret = read_worker_from_env_or_dotenv(ROOT)
-    if worker_url and relay_secret:
-        if skip_live_check:
-            print("  [!] Skipping live Worker Relay API test (--skip-live-check set).")
-        else:
-            print("  [*] Testing Zero-Token Worker Relay live (auth + upstream Gateway)...")
-            check = verify_credentials_before_build(worker_url=worker_url, relay_secret=relay_secret)
-            if not check.get("ok"):
-                raise RuntimeError(str(check.get("error") or "Worker Relay verification failed."))
-            print(
-                f"  [OK] Pre-build Worker Relay check passed "
-                f"({check.get('rule_count', 0)} rules, {check.get('list_count', 0)} lists; CF keys kept off client)."
-            )
-        digest = compile_native_seal_dll(worker_url=worker_url, relay_secret=relay_secret)
-        print(f"  [OK] Zero-Token Worker Relay sg_seal.dll compiled & stripped (SHA-256: {digest[:16]}...)")
-        return
-
-    if not allow_unsafe_direct:
-        raise RuntimeError(
-            "Worker Relay credentials (WORKER_URL & RELAY_CLIENT_SECRET) are missing in .env!\n"
-            "  To prevent Cloudflare API keys from ever touching client machines:\n"
-            "    1. Follow worker/README.md (run: npx wrangler login ; .\\worker\\setup-worker.ps1)\n"
-            "    2. Ensure WORKER_URL and RELAY_CLIENT_SECRET are set in .env\n"
-            "    3. Re-run: .\\.venv\\Scripts\\python.exe build.py\n"
-            "  (Only pass --allow-unsafe-direct-cf if explicitly building an offline single-PC test binary.)"
-        )
-
-    acct_id, api_token = read_cf_from_env_or_dotenv(ROOT)
-    if not acct_id or not api_token:
-        raise RuntimeError(
-            "Direct CF credentials not found. Ensure ACCOUNT_ID and API_TOKEN are set in .env."
-        )
-    print("  [!] WARNING: --allow-unsafe-direct-cf active (sealing direct Cloudflare keys into native DLL).")
-    if not skip_live_check:
-        check = verify_credentials_before_build(account_id=acct_id, api_token=api_token)
-        if not check.get("ok"):
-            raise RuntimeError(str(check.get("error") or "Cloudflare credential verification failed."))
-        print(
-            f"  [OK] Pre-build Cloudflare API check passed "
-            f"({check.get('rule_count', 0)} rules, {check.get('list_count', 0)} lists)."
-        )
-    digest = compile_native_seal_dll(account_id=acct_id, api_token=api_token)
-    print(f"  [OK] Direct Native WinHTTP sg_seal.dll compiled & stripped (SHA-256: {digest[:16]}...)")
+    SEAL_DLL_PATH.unlink(missing_ok=True)
+    print("  [OK] Worker URL, relay key, account ID, and API token are not embedded in the new build.")
 
 
 def cleanup_build_artifacts() -> None:
@@ -290,7 +245,6 @@ def build_nuitka() -> None:
         "--nofollow-import-to=numpy,scipy,matplotlib,pandas,PIL,pytest,unittest,IPython,tkinter,google.genai",
         f"--include-data-dir={ROOT / 'sentinelgate' / 'ui'}=sentinelgate/ui",
         f"--include-data-files={VALIDATOR_BIN}=sentinelgate/validator/bin/cf_validator.exe",
-        f"--include-data-files={SEAL_DLL_PATH}=sentinelgate/config/sg_seal.dll",
         "--output-filename=SentinelGateAI.exe",
         f"--output-dir={DIST_DIR}",
         str(ROOT / "sentinelgate" / "main.py"),
@@ -335,14 +289,10 @@ def build_single_setup_installer(payload_exe: Path, out_setup: Path | None = Non
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build tamper-proof SentinelGateAI-Setup.exe (Zero-Token Worker Relay + Nuitka + Rust seal)"
+        description="Build SentinelGateAI-Setup.exe with runtime-configured Worker relay"
     )
-    parser.add_argument("--skip-live-check", action="store_true", help="Skip pre-build live API test (offline build only)")
-    parser.add_argument(
-        "--allow-unsafe-direct-cf",
-        action="store_true",
-        help="Unsafe fallback: embed direct CF credentials locally if WORKER_URL is not configured",
-    )
+    parser.add_argument("--skip-live-check", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--allow-unsafe-direct-cf", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     try:

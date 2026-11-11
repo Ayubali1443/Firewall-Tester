@@ -7,7 +7,7 @@ const VIEW_META = {
   search: ["Search & Regex Engine", "Pentester module: RE2 obfuscation, Rust 512KB DFA validation, chunking & brute-force testing"],
   ai: ["AI Slip-Through Hunter", "On-demand Gemini threat agent focused strictly on proxies, downloaders & obscure adult slip-throughs"],
   uptester: ["Uptester Monitor (Read-Only)", "Strictly read-only verification of necessary blocks and essential daily uptime baselines"],
-  jsoneditor: ["JSON Files Editor", "Edit installed data/*.json files directly inside the app or Explorer (Cloudflare-deletion safe)"],
+  jsoneditor: ["JSON Data Files", "Edit data files outside the app, then reload to apply changes"],
   settings: ["API Vault & Security", "Windows DPAPI encrypted credential management and tamper-proof architecture diagnostics"]
 };
 
@@ -73,8 +73,11 @@ function switchView(viewId) {
   if (viewId === "search") loadSearchDatasets();
   if (viewId === "ai") populateAiCategories();
   if (viewId === "uptester") loadUptesterDatasets();
-  if (viewId === "jsoneditor") loadSelectedJsonFile();
-  if (viewId === "settings") refreshVaultAndSecurity();
+  if (viewId === "jsoneditor") loadJsonFilesInfo();
+  if (viewId === "settings") {
+    refreshVaultAndSecurity();
+    loadJsonFilesInfo();
+  }
 }
 
 document.querySelectorAll(".nav-btn").forEach((btn) => {
@@ -606,9 +609,11 @@ async function refreshVaultAndSecurity() {
 
   setKeyUi("vault-gemini-primary", "badge-gem-p", keys.GEMINI_API_KEY);
   setKeyUi("vault-gemini-backup", "badge-gem-b", keys.GEMINI_API_KEY_BACKUP);
+  setKeyUi("vault-worker-url", "badge-worker-url", keys.WORKER_URL);
+  setKeyUi("vault-worker-secret", "badge-worker-secret", keys.RELAY_CLIENT_SECRET);
 
   const cfSealedBadge = document.getElementById("badge-cf-sealed");
-  cfSealedBadge.textContent = "SEALED & LOCKED";
+  cfSealedBadge.textContent = "WORKER ONLY";
   cfSealedBadge.className = "badge badge-lock";
 
   const cf = overview.cloudflare || {};
@@ -616,10 +621,10 @@ async function refreshVaultAndSecurity() {
   const val = overview.validator || {};
   const diagBox = document.getElementById("security-diagnostics-box");
   diagBox.innerHTML = [
-    ["Cloudflare API Protection", "Hidden & sealed inside native WinHTTP machine code (non-editable, zero Python token exposure)", true, "SEALED & LOCKED"],
+    ["Cloudflare API Token", "Stored as an encrypted Worker Secret and managed in the Cloudflare dashboard", true, "WORKER ONLY"],
     ["Cloudflare Engine Connectivity", cf.ready ? `Ready (${cf.total_gateway_rules || 0} Gateway Rules)` : "Offline", Boolean(cf.ready), cf.ready ? "READY" : "OFFLINE"],
     ["AI Key DPAPI Vault", v.vault_encrypted ? "Active (Windows CryptProtectData - AI keys only)" : "Initializing", v.vault_encrypted, v.vault_encrypted ? "SECURE" : "WARN"],
-    ["Immutable Baseline Blocklists", `DNS: ${integ.dns_active_count}/${integ.dns_baseline_count} • Search: ${integ.search_active_count}/${integ.search_baseline_count}`, integ.dns_intact && integ.search_intact, (integ.dns_intact && integ.search_intact) ? "SECURE" : "WARN"],
+    ["Active Local Blocklists", `DNS: ${integ.dns_active_count} entries • Search: ${integ.search_active_count} entries`, integ.dns_intact && integ.search_intact, (integ.dns_intact && integ.search_intact) ? "VALID" : "WARN"],
     ["Allow-Listing & Policy Deletion", "Disabled at API, UI & Storage layers", integ.block_only_enforced, integ.block_only_enforced ? "SECURE" : "WARN"],
     ["Uptester Module Isolation", "Strictly Read-Only (CloudflareReadOnlyClient)", true, "SECURE"],
     ["Rust cf_validator SHA-256 Guard", val.ok ? "Checksum Verified" : "Pending Setup", val.ok, val.ok ? "SECURE" : "WARN"]
@@ -637,72 +642,87 @@ async function refreshVaultAndSecurity() {
   if (dirEl && overview.data_dir) {
     dirEl.textContent = overview.data_dir;
   }
+  const overviewDir = document.getElementById("json-data-dir-overview");
+  if (overviewDir && overview.data_dir) overviewDir.textContent = overview.data_dir;
 }
 
 async function openDataFolder() {
   try {
     const res = await apiFetch("/api/storage/open-folder", { method: "POST" });
-    setFeedback("json-folder-feedback", `Opened editable JSON folder: ${res.data_dir}`, true);
+    document.querySelectorAll("#json-folder-feedback, #json-file-feedback").forEach((el) => {
+      el.textContent = `Opened data folder: ${res.data_dir}`;
+      el.className = "feedback ok";
+    });
+    await loadJsonFilesInfo();
   } catch (err) {
-    setFeedback("json-folder-feedback", err.message, false);
+    document.querySelectorAll("#json-folder-feedback, #json-file-feedback").forEach((el) => {
+      el.textContent = err.message;
+      el.className = "feedback err";
+    });
   }
 }
 
 async function reloadDatasetsFromJson() {
-  await Promise.all([loadDnsDatasets(), loadSearchDatasets(), loadUptesterCategories(), refreshOverview()]);
-  setFeedback("json-folder-feedback", "Reloaded JSON files cleanly (existing Cloudflare blocks preserved).", true);
-}
-
-async function loadSelectedJsonFile() {
-  const fname = document.getElementById("json-editor-select").value;
   try {
-    const res = await apiFetch(`/api/storage/json/${encodeURIComponent(fname)}`);
-    document.getElementById("json-editor-filepath").textContent = res.path;
-    document.getElementById("json-editor-textarea").value = res.content;
-    setFeedback("json-editor-feedback", `Loaded ${fname}`, true);
-  } catch (err) {
-    setFeedback("json-editor-feedback", err.message, false);
-  }
-}
-
-function formatJsonEditorText() {
-  const ta = document.getElementById("json-editor-textarea");
-  try {
-    const parsed = JSON.parse(ta.value);
-    ta.value = JSON.stringify(parsed, null, 4);
-    setFeedback("json-editor-feedback", "Formatted JSON cleanly.", true);
-  } catch (err) {
-    setFeedback("json-editor-feedback", `Invalid JSON syntax: ${err.message}`, false);
-  }
-}
-
-async function saveJsonEditorFile() {
-  const fname = document.getElementById("json-editor-select").value;
-  const content = document.getElementById("json-editor-textarea").value;
-  try {
-    const res = await apiFetch(`/api/storage/json/${encodeURIComponent(fname)}`, {
-      method: "POST",
-      body: JSON.stringify({ content }),
+    const refreshed = await apiFetch("/api/storage/reload", { method: "POST" });
+    await Promise.all([
+      loadDnsDatasets(),
+      loadSearchDatasets(),
+      loadUptesterDatasets(),
+      refreshOverview(),
+      loadJsonFilesInfo()
+    ]);
+    lastDnsRemediationMap = {};
+    document.getElementById("btn-dns-remediate-last").classList.add("hidden");
+    const upResults = document.getElementById("uptester-results-box");
+    if (upResults) upResults.innerHTML = '<div class="muted">Dataset reloaded. Run an audit to see fresh results.</div>';
+    const chunks = document.getElementById("chunks-preview-box");
+    if (chunks) chunks.classList.add("hidden");
+    const summary = `${refreshed.dns_categories} DNS categories / ${refreshed.dns_domains} domains; ${refreshed.search_categories} search categories / ${refreshed.search_terms} terms.`;
+    document.querySelectorAll("#json-folder-feedback, #json-file-feedback").forEach((el) => {
+      el.textContent = `Reloaded files from disk. ${summary} Removed-item test state was cleared; existing Cloudflare blocks are unchanged.`;
+      el.className = "feedback ok";
     });
-    setFeedback(
-      "json-editor-feedback",
-      `Saved ${res.filename} (${res.categories} categories, ${res.active_items} active items). Deletions never remove Cloudflare blocks.`,
-      true
-    );
-    await Promise.all([loadDnsDatasets(), loadSearchDatasets(), loadUptesterCategories(), refreshOverview()]);
   } catch (err) {
-    setFeedback("json-editor-feedback", err.message, false);
+    document.querySelectorAll("#json-folder-feedback, #json-file-feedback").forEach((el) => {
+      el.textContent = err.message;
+      el.className = "feedback err";
+    });
+  }
+}
+
+async function loadJsonFilesInfo() {
+  try {
+    const res = await apiFetch("/api/storage/files");
+    document.querySelectorAll("#json-data-dir-path, #json-data-dir-overview").forEach((dir) => {
+      dir.textContent = res.data_dir;
+    });
+    const rows = (res.files || []).map((file) => {
+      const modified = file.modified_at ? new Date(file.modified_at * 1000).toLocaleString() : "Missing";
+      const size = Number.isFinite(file.size) ? `${file.size.toLocaleString()} bytes` : "";
+      return `<div class="mini-row"><div><strong>${escapeHtml(file.name)}</strong><div class="muted">${escapeHtml(file.path)}</div></div><span class="muted">${escapeHtml(modified)} ${escapeHtml(size)}</span></div>`;
+    }).join("");
+    document.querySelectorAll("#json-files-list, #json-files-list-overview").forEach((list) => {
+      list.innerHTML = rows;
+    });
+  } catch (err) {
+    document.querySelectorAll("#json-folder-feedback, #json-file-feedback").forEach((el) => {
+      el.textContent = err.message;
+      el.className = "feedback err";
+    });
   }
 }
 
 async function saveVaultCredentials() {
   const payload = {
     GEMINI_API_KEY: document.getElementById("vault-gemini-primary").value.trim(),
-    GEMINI_API_KEY_BACKUP: document.getElementById("vault-gemini-backup").value.trim()
+    GEMINI_API_KEY_BACKUP: document.getElementById("vault-gemini-backup").value.trim(),
+    WORKER_URL: document.getElementById("vault-worker-url").value.trim(),
+    RELAY_CLIENT_SECRET: document.getElementById("vault-worker-secret").value.trim()
   };
   try {
     await apiFetch("/api/vault/update", { method: "POST", body: JSON.stringify(payload) });
-    setFeedback("vault-feedback", "AI API keys securely sealed in Windows DPAPI Vault.", true);
+    setFeedback("vault-feedback", "Settings securely saved in the Windows DPAPI Vault.", true);
     await refreshVaultAndSecurity();
     await refreshOverview();
   } catch (err) {
@@ -954,7 +974,7 @@ function watchJob(jobId, onComplete, onProgress) {
           dedup_packing: ["PACKING UNIQUE TERMS", "badge-running"],
           fetching_rules: ["READING LIVE POLICIES", "badge-running"],
           pushing_in_place: [`PUSHING IN-PLACE (${prog.pushed || 0}/${prog.total || "?"}) • 0 DELETIONS`, "badge-lock"],
-          trimming_trailing: [`TRIMMING TRAILING (${prog.deleted || 0}/${prog.delete_total || "?"})`, "badge-warn"],
+          obsolete_retained: [`OLD RULES RETAINED (${prog.retained || 0})`, "badge-lock"],
           aborted_preserved: ["INTERRUPTED • PRIOR RULES KEPT", "badge-err"],
           completed: ["100% ENFORCED", "badge-ok"]
         };

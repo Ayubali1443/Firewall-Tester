@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from sentinelgate.config.paths import (
     get_app_data_dir,
@@ -25,13 +28,14 @@ from sentinelgate.core.quality_gate import is_multipurpose_cdn_domain
 
 
 class StorageManager:
-    """Thread-safe tamper-resistant dataset manager.
+    """Thread-safe dataset manager for JSON-driven local state and append-only remote state.
 
     Invariants enforced regardless of dev or compiled execution:
-    1. Immutable compiled-in baselines are ALWAYS merged into active blocklists.
+    1. Compiled-in baselines seed missing JSON files; existing JSON is authoritative.
     2. Only 'block' actions are accepted in Pentester datasets (no allow-listing).
-    3. Deleting domains, search terms, or categories is strictly unsupported.
-    4. In compiled builds, user/AI additions are sealed via Windows DPAPI on disk.
+    3. External JSON controls active local datasets, including removals of seeded defaults.
+    4. Removing JSON entries never deletes already-created Cloudflare protections.
+    5. In compiled builds, the legacy addition ledger and runtime state are sealed via Windows DPAPI.
     """
 
     def __init__(
@@ -94,25 +98,67 @@ class StorageManager:
         path.write_bytes(dpapi_protect(encoded))
 
     def _read_dev_json(self, filename: str, fallback: dict[str, Any]) -> dict[str, Any]:
-        """Read editable JSON on disk in BOTH dev and installed builds (block additions are latched)."""
+        """Read a dataset JSON file; malformed files are reported instead of hidden."""
         json_path = self.workspace_data_dir / filename
-        if json_path.exists():
-            try:
-                data = json.loads(json_path.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    return data
-            except Exception:
-                pass
-        return copy.deepcopy(fallback)
+        if not json_path.exists():
+            return copy.deepcopy(fallback)
+        try:
+            data = json.loads(json_path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Cannot load {json_path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError(f"{json_path} must contain a JSON object keyed by category.")
+        self._validate_dataset_json(filename, data, json_path)
+        return data
+
+    @staticmethod
+    def _validate_dataset_json(filename: str, data: dict[str, Any], path: Path) -> None:
+        if filename in ("dns_blocklist.json", "dns_uptime_sites.json"):
+            item_key = "domains"
+        else:
+            item_key = "terms"
+        is_blocklist = filename in ("dns_blocklist.json", "search_blocklist.json")
+        for category, cfg in data.items():
+            if not isinstance(cfg, dict):
+                raise ValueError(f"{path}: category {category!r} must contain an object.")
+            # Allow records remain ignored in blocklist files and are valid uptime data.
+            if is_blocklist and (
+                "+allow" in str(category).lower()
+                or str(cfg.get("action", "block")).lower() != "block"
+            ):
+                continue
+            items = cfg.get(item_key, [])
+            if not isinstance(items, list) or any(not isinstance(item, str) for item in items):
+                raise ValueError(f"{path}: {category!r}.{item_key} must be an array of strings.")
 
     def _write_dev_json(self, filename: str, data: dict[str, Any]) -> None:
-        """Persist dataset updates cleanly to the editable JSON folder on disk."""
+        """Atomically persist dataset or state JSON without leaving partial files."""
+        self.workspace_data_dir.mkdir(parents=True, exist_ok=True)
+        json_path = self.workspace_data_dir / filename
+        temp_path: Path | None = None
         try:
-            self.workspace_data_dir.mkdir(parents=True, exist_ok=True)
-            json_path = self.workspace_data_dir / filename
-            json_path.write_text(json.dumps(data, indent=4), encoding="utf-8")
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", newline="\n", dir=self.workspace_data_dir,
+                prefix=f".{filename}.", suffix=".tmp", delete=False,
+            ) as stream:
+                temp_path = Path(stream.name)
+                stream.write(json.dumps(data, indent=4, ensure_ascii=False) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp_path, json_path)
         except Exception:
-            pass
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+            raise
+
+    @staticmethod
+    def _normalize_json_hostname(value: str) -> str:
+        raw = value.strip().lower()
+        if raw.startswith(("http://", "https://")):
+            raw = urlsplit(raw).hostname or ""
+        else:
+            raw = raw.split("/", 1)[0].split(":", 1)[0]
+        return raw.strip().strip(".")
 
     # --- Monotonic Baseline + Overlay Merging ---
     @staticmethod
@@ -128,7 +174,14 @@ class StorageManager:
             if not cat:
                 continue
             canonical_id = f"{cat}+block"
-            domains = [str(d).strip().lower() for d in cfg.get("domains", []) if str(d).strip()]
+            domains = [
+                StorageManager._normalize_json_hostname(str(d))
+                for d in cfg.get("domains", []) if str(d).strip()
+            ]
+            domains = [
+                d for d in domains
+                if "." in d and not any(ch.isspace() for ch in d) and not is_multipurpose_cdn_domain(d)
+            ]
             if canonical_id not in merged:
                 merged[canonical_id] = {
                     "category": cat,
@@ -202,9 +255,7 @@ class StorageManager:
                 continue
             canonical_id = f"{cat}+block"
             raw_domains = [
-                str(d).strip().lower().removeprefix("https://").removeprefix("http://").split("/")[0]
-                for d in cfg.get("domains", [])
-                if str(d).strip()
+                self._normalize_json_hostname(str(d)) for d in cfg.get("domains", []) if str(d).strip()
             ]
             valid_domains = [d for d in dict.fromkeys(raw_domains) if "." in d and not is_multipurpose_cdn_domain(d)]
             known = set(BASELINE_DNS_BLOCKLIST.get(canonical_id, {}).get("domains", [])) | set(
@@ -293,8 +344,12 @@ class StorageManager:
             overlay_root = self._read_dpapi_json(self.overlay_path)
             if self._latch_json_dns_additions(json_data, overlay_root):
                 self._write_dpapi_json(self.overlay_path, overlay_root)
-            base = self._merge_dns_blocklists(BASELINE_DNS_BLOCKLIST, json_data)
-            return self._merge_dns_blocklists(base, overlay_root.get("dns", {}))
+            # The current disk file controls visible app data. The DPAPI overlay
+            # records legacy additions but must not resurrect entries removed from JSON.
+            # A present JSON file is the user's desired local state. Defaults are
+            # copied into a new file once, but must not be re-merged on reload:
+            # doing so resurrects entries the user intentionally removed.
+            return self._merge_dns_blocklists({}, json_data)
 
     def load_search_blocklist(self) -> dict[str, Any]:
         with self._lock:
@@ -302,8 +357,7 @@ class StorageManager:
             overlay_root = self._read_dpapi_json(self.overlay_path)
             if self._latch_json_search_additions(json_data, overlay_root):
                 self._write_dpapi_json(self.overlay_path, overlay_root)
-            base = self._merge_search_blocklists(BASELINE_SEARCH_BLOCKLIST, json_data)
-            return self._merge_search_blocklists(base, overlay_root.get("search", {}))
+            return self._merge_search_blocklists({}, json_data)
 
     def load_dns_uptime_sites(self) -> dict[str, Any]:
         with self._lock:
@@ -338,6 +392,57 @@ class StorageManager:
             filename = "dns_pentest_state.json" if kind == "dns_pentest" else "dns_uptime_state.json"
             self._write_dev_json(filename, state)
 
+    def reload_external_datasets(self) -> dict[str, Any]:
+        """Validate the on-disk datasets and prune cached statuses for removed items."""
+        with self._lock:
+            dns = self.load_dns_blocklist()
+            search = self.load_search_blocklist()
+            dns_uptime = self.load_dns_uptime_sites()
+            search_uptime = self.load_search_uptime_terms()
+
+            current_items = {
+                "dns_pentest": {item for cfg in dns.values() for item in cfg.get("domains", [])},
+                "dns_uptime": {item for cfg in dns_uptime.values() for item in cfg.get("domains", [])},
+            }
+            for kind, valid_items in current_items.items():
+                old_state = self.load_state(kind)
+                new_state = {key: value for key, value in old_state.items() if key in valid_items}
+                if new_state != old_state:
+                    self.save_state(kind, new_state)
+
+            return {
+                "data_dir": str(self.workspace_data_dir),
+                "dns_categories": len(dns),
+                "dns_domains": sum(len(cfg.get("domains", [])) for cfg in dns.values()),
+                "search_categories": len(search),
+                "search_terms": sum(len(cfg.get("terms", [])) for cfg in search.values()),
+                "dns_uptime_categories": len(dns_uptime),
+                "search_uptime_categories": len(search_uptime),
+            }
+
+    def get_dataset_file_manifest(self) -> dict[str, Any]:
+        """Return file locations and timestamps without exposing editable file contents."""
+        files = []
+        for filename in (
+            "dns_blocklist.json",
+            "search_blocklist.json",
+            "dns_uptime_sites.json",
+            "search_uptime_terms.json",
+        ):
+            path = self.workspace_data_dir / filename
+            try:
+                stat = path.stat()
+                files.append({
+                    "name": filename,
+                    "path": str(path),
+                    "modified_at": stat.st_mtime,
+                    "size": stat.st_size,
+                    "exists": True,
+                })
+            except OSError:
+                files.append({"name": filename, "path": str(path), "exists": False})
+        return {"data_dir": str(self.workspace_data_dir), "files": files}
+
     # --- Public Append-Only Write APIs (Pentester Only) ---
     @staticmethod
     def _validate_block_category_name(category: str) -> str:
@@ -365,7 +470,7 @@ class StorageManager:
         cat = self._validate_block_category_name(category_or_list_id)
         list_id = f"{cat}+block"
         cleaned_domains = [
-            d.strip().lower().removeprefix("https://").removeprefix("http://").split("/")[0]
+            self._normalize_json_hostname(d)
             for d in domains
             if d and d.strip()
         ]
@@ -383,6 +488,22 @@ class StorageManager:
             added = [d for d in cleaned_domains if d not in existing_set]
 
             if added:
+                json_data = self._read_dev_json("dns_blocklist.json", BASELINE_DNS_BLOCKLIST)
+                entry = json_data.setdefault(
+                    list_id,
+                    {
+                        "category": cat,
+                        "action": "block",
+                        "ai_target": True,
+                        "scope": "slip_through",
+                        "description": description or current.get(list_id, {}).get("description", ""),
+                        "domains": [],
+                    },
+                )
+                entry.setdefault("domains", [])
+                entry["domains"] = list(dict.fromkeys(entry["domains"] + added))
+                self._write_dev_json("dns_blocklist.json", json_data)
+
                 overlay_root = self._read_dpapi_json(self.overlay_path)
                 dns_overlay = overlay_root.setdefault("dns", {})
                 if list_id not in dns_overlay:
@@ -400,9 +521,6 @@ class StorageManager:
                         dns_overlay[list_id]["domains"].append(d)
                         ov_set.add(d)
                 self._write_dpapi_json(self.overlay_path, overlay_root)
-
-                updated = self.load_dns_blocklist()
-                self._write_dev_json("dns_blocklist.json", updated)
 
             return {
                 "list_id": list_id,
@@ -438,6 +556,27 @@ class StorageManager:
             existing_set = set(t.lower() for t in current.get(list_id, {}).get("terms", []))
             added = [t for t in cleaned_terms if t not in existing_set]
 
+            json_data = self._read_dev_json("search_blocklist.json", BASELINE_SEARCH_BLOCKLIST)
+            entry = json_data.setdefault(
+                list_id,
+                {
+                    "category": cat,
+                    "action": "block",
+                    "ai_target": True,
+                    "scope": "slip_through",
+                    "description": description or current.get(list_id, {}).get("description", ""),
+                    "terms": [],
+                    "history": [],
+                },
+            )
+            entry.setdefault("terms", [])
+            entry.setdefault("history", [])
+            entry["terms"] = list(dict.fromkeys(entry["terms"] + added))
+            for term in cleaned_hist + added:
+                if term not in entry["history"]:
+                    entry["history"].append(term)
+            self._write_dev_json("search_blocklist.json", json_data)
+
             overlay_root = self._read_dpapi_json(self.overlay_path)
             search_overlay = overlay_root.setdefault("search", {})
             if list_id not in search_overlay:
@@ -463,8 +602,6 @@ class StorageManager:
                     ov_hist.add(h)
 
             self._write_dpapi_json(self.overlay_path, overlay_root)
-            updated = self.load_search_blocklist()
-            self._write_dev_json("search_blocklist.json", updated)
 
             return {
                 "list_id": list_id,
@@ -473,126 +610,60 @@ class StorageManager:
             }
 
     def run_search_skeleton_cleanup(self) -> dict[str, Any]:
-        """Deduplicate obfuscated additions via skeleton clustering without ever removing baseline bases."""
+        """Deduplicate the current JSON search terms without restoring removed defaults."""
         with self._lock:
-            overlay_root = self._read_dpapi_json(self.overlay_path)
-            search_overlay = overlay_root.get("search", {})
+            json_data = self._read_dev_json("search_blocklist.json", BASELINE_SEARCH_BLOCKLIST)
             current_full = self.load_search_blocklist()
-
             merged_events: list[dict[str, str]] = []
-            for list_id, ov_cfg in search_overlay.items():
-                base_terms = set(
-                    t.lower()
-                    for t in BASELINE_SEARCH_BLOCKLIST.get(list_id, {}).get("terms", [])
-                )
-                combined_cfg = copy.deepcopy(current_full.get(list_id, ov_cfg))
+            for list_id, cfg in json_data.items():
+                if not isinstance(cfg, dict) or str(cfg.get("action", "block")).lower() != "block":
+                    continue
+                canonical_id = list_id if list_id.endswith("+block") else f"{cfg.get('category') or list_id}+block"
+                base_terms = {
+                    str(t).lower() for t in BASELINE_SEARCH_BLOCKLIST.get(canonical_id, {}).get("terms", [])
+                }
+                combined_cfg = copy.deepcopy(current_full.get(canonical_id, cfg))
                 removed = clean_category(combined_cfg)
-                surviving = set(t.lower() for t in combined_cfg.get("terms", []))
-
-                # Only drop from overlay if the canonical base exists in surviving or baseline
-                new_ov_terms = []
-                for t in ov_cfg.get("terms", []):
-                    tl = t.lower()
-                    if tl in surviving or tl in base_terms:
-                        new_ov_terms.append(t)
+                surviving = {str(t).lower() for t in combined_cfg.get("terms", [])}
+                kept_terms = []
+                for term in cfg.get("terms", []):
+                    normalized = str(term).strip().lower()
+                    if normalized in surviving or normalized in base_terms:
+                        kept_terms.append(term)
+                        continue
+                    merged_base = next((base for tweaked, base in removed if str(tweaked).lower() == normalized), None)
+                    if merged_base and str(merged_base).lower() in (surviving | base_terms):
+                        merged_events.append({"list_id": canonical_id, "tweaked": term, "merged_into": merged_base})
                     else:
-                        merged_base = next((b for tw, b in removed if tw.lower() == tl), None)
-                        if merged_base and (
-                            merged_base.lower() in surviving or merged_base.lower() in base_terms
-                        ):
-                            merged_events.append(
-                                {"list_id": list_id, "tweaked": t, "merged_into": merged_base}
-                            )
-                        else:
-                            new_ov_terms.append(t)
-                ov_cfg["terms"] = new_ov_terms
+                        kept_terms.append(term)
+                cfg["terms"] = list(dict.fromkeys(kept_terms))
 
-            self._write_dpapi_json(self.overlay_path, overlay_root)
-            updated = self.load_search_blocklist()
-            self._write_dev_json("search_blocklist.json", updated)
+            self._write_dev_json("search_blocklist.json", json_data)
             return {
                 "merged_count": len(merged_events),
                 "events": merged_events[:100],
-                "baseline_preserved": True,
+                "json_is_source_of_truth": True,
             }
 
-    EDITABLE_JSON_FILES = (
-        "dns_blocklist.json",
-        "search_blocklist.json",
-        "dns_uptime_sites.json",
-        "search_uptime_terms.json",
-    )
-
-    def read_editable_json_text(self, filename: str) -> tuple[Path, str]:
-        """Return persistent file path and formatted JSON text for an editable dataset."""
-        if filename not in self.EDITABLE_JSON_FILES:
-            raise ValueError(f"Unsupported editable JSON file: {filename}")
-        with self._lock:
-            self._ensure_editable_json_files()
-            target = self.workspace_data_dir / filename
-            return target, target.read_text(encoding="utf-8")
-
-    def save_editable_json_text(self, filename: str, raw_text: str) -> dict[str, Any]:
-        """Validate & save editable JSON file safely (add-only on Cloudflare; allow-listing rejected)."""
-        if filename not in self.EDITABLE_JSON_FILES:
-            raise ValueError(f"Unsupported editable JSON file: {filename}")
-        parsed = json.loads(raw_text)
-        if not isinstance(parsed, dict):
-            raise ValueError("JSON root must be an object/dictionary.")
-
-        if filename in ("dns_blocklist.json", "search_blocklist.json"):
-            for key, cfg in parsed.items():
-                if "+allow" in str(key).lower():
-                    raise PermissionError("Allow-listing is prohibited in blocklist JSON files.")
-                if isinstance(cfg, dict) and str(cfg.get("action", "block")).lower() != "block":
-                    raise PermissionError(f"Category '{key}' must keep action='block'.")
-
-        formatted = json.dumps(parsed, indent=4)
-        with self._lock:
-            target = self.workspace_data_dir / filename
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(formatted, encoding="utf-8")
-            # Immediately latch any new block additions monotonically (deletions never remove from Cloudflare)
-            if filename == "dns_blocklist.json":
-                merged = self.load_dns_blocklist()
-                item_count = sum(len(v.get("domains", [])) for v in merged.values())
-            elif filename == "search_blocklist.json":
-                merged = self.load_search_blocklist()
-                item_count = sum(len(v.get("terms", [])) for v in merged.values())
-            elif filename == "dns_uptime_sites.json":
-                merged = self.load_dns_uptime_sites()
-                item_count = sum(len(v.get("domains", [])) for v in merged.values())
-            else:
-                merged = self.load_search_uptime_terms()
-                item_count = sum(len(v.get("terms", [])) for v in merged.values())
-
-        return {
-            "filename": filename,
-            "path": str(target),
-            "categories": len(merged),
-            "active_items": item_count,
-        }
-
     def verify_integrity(self) -> dict[str, Any]:
-        """Confirm baseline lists and overlay integrity have not been stripped."""
+        """Report active local dataset validity and block-only enforcement."""
         dns = self.load_dns_blocklist()
         search = self.load_search_blocklist()
 
-        dns_baseline_total = sum(len(v.get("domains", [])) for v in BASELINE_DNS_BLOCKLIST.values())
         dns_active_total = sum(len(v.get("domains", [])) for v in dns.values())
-
-        search_baseline_total = sum(len(v.get("terms", [])) for v in BASELINE_SEARCH_BLOCKLIST.values())
         search_active_total = sum(len(v.get("terms", [])) for v in search.values())
+        dns_valid = all(v.get("action") == "block" for v in dns.values())
+        search_valid = all(v.get("action") == "block" for v in search.values())
 
         return {
             "compiled_binary": self.compiled,
             "dpapi_overlay_exists": self.overlay_path.exists(),
-            "dns_baseline_count": dns_baseline_total,
+            "dns_baseline_count": sum(len(v.get("domains", [])) for v in BASELINE_DNS_BLOCKLIST.values()),
             "dns_active_count": dns_active_total,
-            "dns_intact": dns_active_total >= dns_baseline_total,
-            "search_baseline_count": search_baseline_total,
+            "dns_intact": dns_valid,
+            "search_baseline_count": sum(len(v.get("terms", [])) for v in BASELINE_SEARCH_BLOCKLIST.values()),
             "search_active_count": search_active_total,
-            "search_intact": search_active_total >= search_baseline_total,
+            "search_intact": search_valid,
             "block_only_enforced": all(
                 v.get("action") == "block"
                 for v in list(dns.values()) + list(search.values())

@@ -896,14 +896,17 @@ class SentinelGateCoreTests(unittest.TestCase):
             self.assertIn("custom-added-proxy.org", loaded_dns["Proxies+block"]["domains"])
             self.assertNotIn("AllowHack+allow", loaded_dns)
 
-            # User now DELETES both custom-added-proxy.org and Proxies+block from JSON:
-            # monotonic DPAPI overlay + baseline MUST keep them intact!
+            # The edited JSON file is authoritative: removing defaults or custom
+            # entries removes them from active local data after reload.
+            dns_raw["Proxies+block"]["domains"].remove("croxyproxy.com")
+            (data_dir / "dns_blocklist.json").write_text(json.dumps(dns_raw, indent=4), encoding="utf-8")
+            loaded_without_default = st.load_dns_blocklist()
+            self.assertNotIn("croxyproxy.com", loaded_without_default["Proxies+block"]["domains"])
+
             del dns_raw["Proxies+block"]
             (data_dir / "dns_blocklist.json").write_text(json.dumps(dns_raw, indent=4), encoding="utf-8")
             loaded_after_del = st.load_dns_blocklist()
-            self.assertIn("Proxies+block", loaded_after_del)
-            self.assertIn("custom-added-proxy.org", loaded_after_del["Proxies+block"]["domains"])
-            self.assertIn("croxyproxy.com", loaded_after_del["Proxies+block"]["domains"])
+            self.assertNotIn("Proxies+block", loaded_after_del)
 
             # 3. User edits search_blocklist.json to add keyword, then deletes it & category from JSON
             search_raw = json.loads((data_dir / "search_blocklist.json").read_text(encoding="utf-8"))
@@ -915,9 +918,7 @@ class SentinelGateCoreTests(unittest.TestCase):
             del search_raw["Web Proxies+block"]
             (data_dir / "search_blocklist.json").write_text(json.dumps(search_raw, indent=4), encoding="utf-8")
             loaded_search_after_del = st.load_search_blocklist()
-            self.assertIn("Web Proxies+block", loaded_search_after_del)
-            self.assertIn("customsearchvector", loaded_search_after_del["Web Proxies+block"]["terms"])
-            self.assertIn("web proxy", loaded_search_after_del["Web Proxies+block"]["terms"])
+            self.assertNotIn("Web Proxies+block", loaded_search_after_del)
 
             # 4. Cloudflare DNS policy sync preserves already-bound $list_ids even if absent from dns_data
             writer = CloudflarePolicyWriter("acct_1", "tok_1")
@@ -970,28 +971,22 @@ class SentinelGateCoreTests(unittest.TestCase):
                 self.assertEqual(resolved_parent, sg_paths._query_process_dir_win32(os.getpid()))
                 self.assertNotEqual(resolved_parent, (td_path / "temp_onefile").resolve())
 
-            # 7. Built-in JSON editor API endpoints support read/save while rejecting allow-listing
+            # 7. Dataset JSON is read-only in app; only file metadata and reload are exposed
             with mock.patch("sentinelgate.core.storage.get_workspace_data_dir", return_value=data_dir), \
                  mock.patch("sentinelgate.core.storage.get_app_data_dir", return_value=app_dir):
                 app, tok = create_app(session_token="json-editor-tok")
                 client = app.test_client()
-                r_bad_name = client.get("/api/storage/json/secret.txt", headers={"X-SG-Token": tok})
-                self.assertEqual(r_bad_name.status_code, 400)
-
-                r_allow = client.post(
-                    "/api/storage/json/dns_blocklist.json",
-                    json={"content": json.dumps({"Bypass+allow": {"action": "allow", "domains": ["x.com"]}})},
-                    headers={"X-SG-Token": tok},
-                )
-                self.assertEqual(r_allow.status_code, 403)
-
-                r_get = client.get("/api/storage/json/search_blocklist.json", headers={"X-SG-Token": tok})
-                self.assertEqual(r_get.status_code, 200)
-                self.assertEqual(r_get.get_json()["filename"], "search_blocklist.json")
+                r_manifest = client.get("/api/storage/files", headers={"X-SG-Token": tok})
+                self.assertEqual(r_manifest.status_code, 200)
+                self.assertIn("search_blocklist.json", [x["name"] for x in r_manifest.get_json()["files"]])
+                r_reload = client.post("/api/storage/reload", headers={"X-SG-Token": tok})
+                self.assertEqual(r_reload.status_code, 200)
+                r_save = client.post("/api/storage/json/dns_blocklist.json", json={"content": "{}"}, headers={"X-SG-Token": tok})
+                self.assertEqual(r_save.status_code, 404)
 
                 ui_html = client.get("/").get_data(as_text=True)
                 self.assertIn("view-jsoneditor", ui_html)
-                self.assertIn("saveJsonEditorFile", ui_html)
+                self.assertNotIn("saveJsonEditorFile", ui_html)
 
     def test_worker_relay_js_auth_and_block_only_rules(self) -> None:
         import json
@@ -1068,7 +1063,7 @@ for (const [method, path, body] of [
   assert.equal(res.status, 403, `Expected 403 for ${method} ${path}`);
 }
 
-// 4. Allowed append & trailing _p2 deletion while active primary exists -> 200
+// 4. Appends remain allowed; even trailing policy deletion is permanently blocked
 r = await worker.fetch(new Request("https://w.example/v1/lists/33333333-3333-3333-3333-333333333333", {
   method: "PATCH",
   headers: { "X-SG-Relay-Key": "relay-sec-789", "Content-Type": "application/json" },
@@ -1080,7 +1075,7 @@ r = await worker.fetch(new Request("https://w.example/v1/rules/22222222-2222-222
   method: "DELETE",
   headers: { "X-SG-Relay-Key": "relay-sec-789" },
 }), ENV);
-assert.equal(r.status, 200);
+assert.equal(r.status, 403);
 console.log("WORKER_JS_OK");
 """.replace("%WORKER_URI%", json.dumps(worker_js.as_uri()))
 
