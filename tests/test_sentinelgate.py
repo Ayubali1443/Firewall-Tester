@@ -81,7 +81,7 @@ class SentinelGateCoreTests(unittest.TestCase):
         self.assertGreaterEqual(len(chunks), 1)
         for ch in chunks:
             traffic = format_traffic_condition(build_flat_regex(ch))
-            self.assertLessEqual(len(traffic.encode("utf-8")), 139000)
+            self.assertLessEqual(len(traffic.encode("utf-8")), 4090)
 
     def test_skeleton_cleaner_and_virtual_pentest(self) -> None:
         self.assertEqual(get_skeleton("p0rn"), get_skeleton("porn"))

@@ -102,10 +102,15 @@ export default {
       const parsed = await readJsonSafe(request);
       if (!parsed.ok) return jsonResp({ success: false, error: "Invalid JSON payload." }, 400);
       const body = parsed.body;
-      if (body?.type !== "DOMAIN") {
-        return jsonResp({ success: false, error: "Only DOMAIN lists are permitted." }, 403);
+      if (body?.type !== "HOSTNAME" && body?.type !== "DOMAIN") {
+        return jsonResp({ success: false, error: "Only hostname/domain lists are permitted." }, 403);
       }
-      return cfFetch(env, "/lists", { method: "POST", body: JSON.stringify(body) });
+      // The desktop contract uses HOSTNAME for DNS targets. Cloudflare Gateway's
+      // current API enum for that list data is DOMAIN.
+      return cfFetch(env, "/lists", {
+        method: "POST",
+        body: JSON.stringify({ ...body, type: "DOMAIN" }),
+      });
     }
 
     if (method === "PATCH" && listMatch) {

@@ -689,7 +689,7 @@ fn validate_body_policy(method: &str, path: &str, body: &str) -> bool {{
         return has_block && !has_bad_action && has_enabled && !has_disabled;
     }}
     if method == "POST" && path_base == "/lists" {{
-        return kvs.iter().any(|(k, v)| k == "type" && v.eq_ignore_ascii_case("DOMAIN"));
+        return kvs.iter().any(|(k, v)| k == "type" && (v.eq_ignore_ascii_case("HOSTNAME") || v.eq_ignore_ascii_case("DOMAIN")));
     }}
     if method == "PATCH" && path_base.starts_with("/lists/") {{
         let has_append = kvs.iter().any(|(k, _)| k == "append");

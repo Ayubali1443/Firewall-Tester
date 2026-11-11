@@ -23,6 +23,9 @@ CF_MAX_LIST_ITEMS_ENTERPRISE = 5000
 # Keep a margin and measure UTF-8 bytes so non-ASCII expressions cannot slip over it.
 CF_MAX_EXPRESSION_BYTES = 139_000
 CF_MAX_EXPRESSION_CHARS = CF_MAX_EXPRESSION_BYTES  # Backward-compatible telemetry key.
+# Search regexes hit Cloudflare's compiled-regex budget well before the general
+# Gateway expression limit. Keep the proven conservative wire-size ceiling.
+CF_MAX_SEARCH_REGEX_BYTES = 4_090
 CF_MAX_DNS_POLICIES = 500
 CF_MAX_HTTP_POLICIES = 500
 CF_LIST_APPEND_BATCH = 500
@@ -430,9 +433,9 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
             return None
         payload = {
             "name": name,
-            # Zero Trust Gateway lists use DOMAIN (HOSTNAME belongs to the
-            # separate account-level Rules Lists API).
-            "type": "DOMAIN",
+            # Keep the relay's hostname-list contract. The Worker translates this
+            # to Cloudflare Gateway's current DOMAIN API enum before forwarding.
+            "type": "HOSTNAME" if self.mode in ("worker", "native_worker") else "DOMAIN",
             "description": "Auto-generated blocklist by SentinelGate AI Pentester",
         }
         try:
@@ -750,10 +753,10 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
             return {"ok": False, "error": "No regex chunks generated.", "sync_phase": "failed"}
         oversized = [
             idx for idx, traffic in enumerate(traffic_chunks, start=1)
-            if len(traffic.encode("utf-8")) > CF_MAX_EXPRESSION_BYTES
+            if len(traffic.encode("utf-8")) > CF_MAX_SEARCH_REGEX_BYTES
         ]
         if oversized:
-            msg = f"Search expression chunk(s) {oversized[:8]} exceed the {CF_MAX_EXPRESSION_BYTES}-byte Gateway limit."
+            msg = f"Search regex chunk(s) {oversized[:8]} exceed the conservative {CF_MAX_SEARCH_REGEX_BYTES}-byte complexity limit."
             if log_cb:
                 log_cb(f"[X] {msg}")
             return {"ok": False, "error": msg, "sync_phase": "failed", "errors": [msg]}
@@ -853,12 +856,12 @@ class CloudflarePolicyWriter(CloudflareReadOnlyClient):
             action_word = "Updating in-place" if target_rule else "Creating new"
             emit_phase(
                 "pushing_in_place",
-                f"{action_word} rule {part_index}/{total_chunks} ({len(traffic.encode('utf-8'))}/{CF_MAX_EXPRESSION_BYTES} bytes)...",
+                f"{action_word} rule {part_index}/{total_chunks} ({len(traffic.encode('utf-8'))}/{CF_MAX_SEARCH_REGEX_BYTES} bytes)...",
                 pushed=part_index - 1,
                 total=total_chunks,
             )
             if log_cb:
-                log_cb(f"  -> {action_word} {policy_name} ({part_index}/{total_chunks}, {len(traffic.encode('utf-8'))}/{CF_MAX_EXPRESSION_BYTES} bytes)...")
+                log_cb(f"  -> {action_word} {policy_name} ({part_index}/{total_chunks}, {len(traffic.encode('utf-8'))}/{CF_MAX_SEARCH_REGEX_BYTES} bytes)...")
 
             try:
                 if target_rule:

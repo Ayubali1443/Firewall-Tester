@@ -370,10 +370,10 @@ async function loadSearchChunks() {
   const box = document.getElementById("chunks-preview-box");
   box.classList.remove("hidden");
   box.innerHTML = `
-    <div><strong>Dynamic Chunk Packing:</strong> ${res.total_terms} unique base terms condensed into <strong>${res.chunk_count}</strong> Cloudflare HTTP rules (max 139,000 expression bytes and local DFA capacity).</div>
+    <div><strong>Dynamic Chunk Packing:</strong> ${res.total_terms} unique base terms condensed into <strong>${res.chunk_count}</strong> Cloudflare HTTP rules (4,090-byte regex safety cap; Cloudflare's larger API limit does not account for compiled regex size).</div>
     ${res.chunks.map((ch) => `
       <div class="mini-row">
-        <span>Part ${ch.part}: <strong>${ch.term_count}</strong> terms (${ch.traffic_length}/139000 bytes)</span>
+        <span>Part ${ch.part}: <strong>${ch.term_count}</strong> terms (${ch.traffic_length}/4090 bytes)</span>
         <span class="muted">${escapeHtml(ch.sample_terms.join(", "))}...</span>
       </div>
     `).join("")}

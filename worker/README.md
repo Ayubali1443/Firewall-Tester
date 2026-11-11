@@ -13,7 +13,7 @@ Even if an attacker inspects a client computer, the real Cloudflare API credenti
 1. **Zero Cloudflare keys on client PCs:** `CF_ACCOUNT_ID` and `CF_API_TOKEN` never leave Cloudflare infrastructure.
 2. **Constant-time client auth (`X-SG-Relay-Key`):** Every route rejects missing or wrong relay keys with `401 Unauthorized`.
 3. **Server-side Block-Only Policy Firewall (`403 Forbidden`):**
-   - `POST /v1/lists`: permits only `type: "DOMAIN"` (Cloudflare Zero Trust Gateway domain lists).
+   - `POST /v1/lists`: permits hostname/domain lists and translates the client `HOSTNAME` type to Cloudflare Gateway's `DOMAIN` API type.
    - `PATCH /v1/lists/:id`: **append-only** (forbids `remove` or overwriting `items`).
    - `POST /v1/rules` & `PUT /v1/rules/:id`: enforces `action === "block"` and `enabled === true` (blocks creating `allow` rules or disabling policies).
    - `DELETE /v1/rules/:id`: strictly blocked except removing trailing shard chunks (`automated_block_p2+` / `automated_http_search_block_p2+`) while an active primary `block` rule still exists.
